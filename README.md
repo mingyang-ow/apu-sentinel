@@ -17,3 +17,20 @@ make test                # full suite, incl. leakage guards
 
 Runs locally (WSL2, CPU, small subset) or on Colab (GPU, full data) from the
 same code — behaviour is selected entirely by `configs/{local,colab}.yaml`.
+
+## Downloading MetroPT-3 (establish-then-pin checksum)
+
+The correct SHA256 for MetroPT-3 is unknown until first download, so
+`data/download.py` runs in one of two modes, selected by `data.checksum` in
+`configs/base.yaml`:
+
+1. **Establish mode** (`checksum: null`, the default): run
+   `uv run python scripts/download.py`. It downloads the file, prints
+   `Computed SHA256: <hash>`, and does not fail — copy that hash into
+   `configs/base.yaml` (`data.checksum`).
+2. **Verify mode** (`checksum` set to that hash): every subsequent run
+   re-verifies the file against the pinned hash and raises if it doesn't
+   match (corruption / re-published dataset / wrong file).
+
+Re-running is idempotent — an existing file in `data/raw/` is verified
+rather than re-downloaded; pass `--force` to re-download.

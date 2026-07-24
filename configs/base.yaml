@@ -3,10 +3,16 @@
 # file. See src/apu_sentinel/config.py for the typed schema this must satisfy.
 
 data:
+  # UCI ML Repository, dataset 791 -- confirm this still resolves before
+  # relying on it; the exact zip layout can change if UCI re-publishes it.
+  url: "https://archive.ics.uci.edu/static/public/791/metropt+3+dataset.zip"
   raw_dir: data/raw
+  raw_filename: "MetroPT3(AirCompressor).csv"
   interim_dir: data/interim
   processed_dir: data/processed
-  checksum: "<sha256 of MetroPT-3 -- fill in once dataset is downloaded>"
+  # null = establish mode (download.py prints the computed hash to pin here).
+  # a string = verify mode (raises on mismatch). See data/download.py.
+  checksum: null
 
 split:
   # Time-based boundaries ONLY. Never a shuffle ratio -- see CLAUDE.md rule 1.
