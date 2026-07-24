@@ -1,0 +1,79 @@
+[project]
+name = "apu-sentinel"
+version = "0.1.0"
+description = "Early-warning anomaly detection on MetroPT-3 Air Production Unit telemetry"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "scikit-learn>=1.4",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "pyyaml>=6.0",
+    "mlflow>=2.11",
+]
+
+[project.optional-dependencies]
+# torch is split into mutually-exclusive extras (see [tool.uv] below) because
+# it is the ONE dependency that cannot resolve identically across our two
+# run environments: local WSL2 (CPU only) and Google Colab (CUDA T4 GPU).
+# Both environments report as linux/x86_64, so there is no platform marker
+# that can pick the right wheel automatically -- the extra must be chosen
+# explicitly per environment:
+#   local WSL2 :  uv sync --extra cpu     (also what `make setup` runs)
+#   Colab      :  uv sync --extra cuda    (what scripts/bootstrap_colab.sh runs)
+# Do NOT collapse this into a single hard-pinned torch build -- that would
+# silently break one of the two environments (no GPU locally, no CUDA on
+# Colab).
+cpu = ["torch>=2.2"]
+cuda = ["torch>=2.2"]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "cuda" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cuda", extra = "cuda" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[build-system]
+requires = ["uv_build>=0.11.23,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+    "pre-commit>=3.7",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# scaffolding-brief.md is the source spec doc, not project source -- its
+# embedded code fences are illustrative snippets, not files ruff should
+# reformat.
+extend-exclude = ["scaffolding-brief.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

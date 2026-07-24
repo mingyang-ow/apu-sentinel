@@ -1,0 +1,31 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv
+
+# Data -- MetroPT-3 and all derived artifacts are NEVER committed.
+# (directory contents ignored, but .gitkeep placeholders kept so the empty
+# dirs themselves are tracked -- a blanket `data/` rule would also hide the
+# negations below, so ignore contents one level down instead.)
+data/raw/*
+data/interim/*
+data/processed/*
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+
+# Experiment tracking
+mlruns/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

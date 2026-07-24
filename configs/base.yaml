@@ -1,0 +1,28 @@
+# Shared config -- merged with configs/local.yaml OR configs/colab.yaml
+# (selected via CONFIG=), then optionally overlaid with a configs/experiment/
+# file. See src/apu_sentinel/config.py for the typed schema this must satisfy.
+
+data:
+  raw_dir: data/raw
+  interim_dir: data/interim
+  processed_dir: data/processed
+  checksum: "<sha256 of MetroPT-3 -- fill in once dataset is downloaded>"
+
+split:
+  # Time-based boundaries ONLY. Never a shuffle ratio -- see CLAUDE.md rule 1.
+  train_end: "<timestamp, e.g. 2020-06-01T00:00:00>"
+  val_end: "<timestamp, e.g. 2020-07-01T00:00:00>"
+
+evaluation:
+  # SWEPT list of candidate pre-failure window widths (minutes). A project
+  # result, not a single magic number -- see CLAUDE.md "pre-failure window
+  # width".
+  window_widths: []
+  # Hysteresis / hold-time (seconds) used to group flagged timestamps into
+  # one episode.
+  episode_hold_time: null
+  # DEFERRED until baseline behaviour has been observed -- do not set before
+  # then.
+  false_alarm_ceiling: null
+
+model: {}

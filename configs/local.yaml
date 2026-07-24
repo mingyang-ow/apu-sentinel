@@ -1,0 +1,11 @@
+# Local WSL2 environment: CPU only, small data subset, fast iteration.
+# Merged on top of configs/base.yaml.
+
+device: cpu
+
+data:
+  subset: 0.05 # fraction of the full series to load locally
+
+train:
+  epochs: 2
+  max_minutes: 5 # wall-clock budget guard, see scripts/train.py

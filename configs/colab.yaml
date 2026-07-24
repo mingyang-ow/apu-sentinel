@@ -1,0 +1,12 @@
+# Google Colab environment: CUDA GPU, full dataset, real training budget.
+# Merged on top of configs/base.yaml.
+
+device: cuda
+
+data:
+  subset: 1.0 # full dataset
+
+train:
+  epochs: 50
+  max_minutes: 120 # wall-clock budget guard -- protects Colab Pro credits,
+  # see scripts/train.py self-terminating run logic.
