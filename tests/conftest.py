@@ -15,9 +15,11 @@ import pytest
 from apu_sentinel.config import (
     EvaluationConfig,
     FailureEvent,
+    ResampleConfig,
     ScalingConfig,
     SplitConfig,
     TrainingExclusionConfig,
+    WindowingConfig,
 )
 from apu_sentinel.data.split import _exclusion_window
 
@@ -267,3 +269,193 @@ def synthetic_scaling_df(
         mask = (df.index >= excl_start) & (df.index < excl_end)
         df.loc[mask, "channel_0"] = 10_000.0
     return df
+
+
+# --- Fixtures for tests/test_windows.py ---------------------------------
+#
+# A regular 1-minute-cadence series with window_duration=10min so
+# window_length=10 samples, train_stride=2min (2 samples), score_stride=1min
+# (1 sample) -- small round numbers that make expected window counts easy to
+# hand-derive.
+
+
+@pytest.fixture
+def synthetic_windowing_config() -> WindowingConfig:
+    return WindowingConfig(
+        window_duration="10min",
+        train_stride="2min",
+        score_stride="1min",
+        gap_tolerance=0.1,
+        gap_threshold="5min",
+        resample=ResampleConfig(enabled=False, interval="1min"),
+    )
+
+
+@pytest.fixture
+def synthetic_windows_scaling_config() -> ScalingConfig:
+    return ScalingConfig(
+        method="robust",
+        analog_columns=["channel_0", "channel_1"],
+        passthrough_columns=["flag_0"],
+    )
+
+
+@pytest.fixture
+def synthetic_windows_split_config() -> SplitConfig:
+    # embargo_hours=1 (60min) comfortably covers window_duration=10min.
+    return SplitConfig(
+        embargo_hours=1,
+        training_exclusion=TrainingExclusionConfig(
+            pre_margin_hours=1, post_settle_hours=1, fallback_post_hours=1
+        ),
+    )
+
+
+@pytest.fixture
+def synthetic_windows_settings(
+    synthetic_windows_split_config, synthetic_windows_scaling_config, synthetic_windowing_config
+):
+    """Duck-typed like apu_sentinel.config.Settings: exposes .split,
+    .scaling, and .windowing.
+    """
+    return SimpleNamespace(
+        split=synthetic_windows_split_config,
+        scaling=synthetic_windows_scaling_config,
+        windowing=synthetic_windowing_config,
+    )
+
+
+@pytest.fixture
+def synthetic_windows_settings_embargo_violation(
+    synthetic_windows_split_config, synthetic_windows_scaling_config
+):
+    """windowing.window_duration (2h) exceeds split.embargo_hours (1h) --
+    make_windows must raise, naming both values.
+    """
+    windowing = WindowingConfig(
+        window_duration="2h",
+        train_stride="30min",
+        score_stride="10min",
+        gap_tolerance=0.1,
+        gap_threshold="30min",
+        resample=ResampleConfig(enabled=False, interval="10min"),
+    )
+    return SimpleNamespace(
+        split=synthetic_windows_split_config,
+        scaling=synthetic_windows_scaling_config,
+        windowing=windowing,
+    )
+
+
+@pytest.fixture
+def synthetic_windows_df() -> pd.DataFrame:
+    """200 minutes of regular 1-minute-cadence data, no gaps."""
+    index = pd.date_range("2020-01-01 00:00", periods=200, freq="1min")
+    rng = np.random.default_rng(2)
+    df = pd.DataFrame(
+        {
+            "channel_0": rng.normal(size=len(index)),
+            "channel_1": rng.normal(size=len(index)),
+            "flag_0": rng.integers(0, 2, size=len(index)).astype(float),
+        },
+        index=index,
+    )
+    df.index.name = "timestamp"
+    return df
+
+
+@pytest.fixture
+def synthetic_windows_df_with_gap(synthetic_windows_df) -> pd.DataFrame:
+    """Same 200-minute series, but rows for minutes 100-119 (inclusive) are
+    removed -- a deliberate 21-minute native gap between the row at minute
+    99 and the row at minute 120.
+    """
+    minute = (synthetic_windows_df.index - synthetic_windows_df.index[0]) // pd.Timedelta(minutes=1)
+    keep_mask = ~((minute >= 100) & (minute <= 119))
+    return synthetic_windows_df.loc[keep_mask]
+
+
+@pytest.fixture
+def synthetic_windows_exclusion_settings(synthetic_split_settings):
+    """Combines the existing split+evaluation fixtures (3 events, embargo
+    4h) with scaling/windowing config sized to make a real, multi-sample
+    train/test fold from synthetic_windows_exclusion_df meaningful:
+    window_duration=2h fits under embargo=4h.
+    """
+    scaling = ScalingConfig(
+        method="robust", analog_columns=["channel_0"], passthrough_columns=["flag_0"]
+    )
+    windowing = WindowingConfig(
+        window_duration="2h",
+        train_stride="30min",
+        score_stride="10min",
+        gap_tolerance=0.1,
+        gap_threshold="1h",
+        resample=ResampleConfig(enabled=False, interval="10min"),
+    )
+    return SimpleNamespace(
+        split=synthetic_split_settings.split,
+        evaluation=synthetic_split_settings.evaluation,
+        scaling=scaling,
+        windowing=windowing,
+    )
+
+
+@pytest.fixture
+def synthetic_windows_exclusion_df(synthetic_split_data_bounds) -> pd.DataFrame:
+    """10-minute-cadence series spanning synthetic_split_data_bounds, fine
+    enough grained that a fold's multi-hour exclusion regions remove many
+    rows -- enough to test that no window bridges across them.
+    """
+    data_start, data_end = synthetic_split_data_bounds
+    index = pd.date_range(data_start, data_end, freq="10min")
+    rng = np.random.default_rng(3)
+    df = pd.DataFrame(
+        {
+            "channel_0": rng.normal(size=len(index)),
+            "flag_0": rng.integers(0, 2, size=len(index)).astype(float),
+        },
+        index=index,
+    )
+    df.index.name = "timestamp"
+    return df
+
+
+@pytest.fixture
+def synthetic_resample_settings(synthetic_windows_split_config):
+    """resample enabled, 1-minute grid -- for testing maybe_resample()'s
+    mean/max aggregation and NaN-for-empty-interval behaviour.
+    """
+    scaling = ScalingConfig(
+        method="robust", analog_columns=["analog_a"], passthrough_columns=["digital_a"]
+    )
+    windowing = WindowingConfig(
+        window_duration="2min",
+        train_stride="1min",
+        score_stride="1min",
+        gap_tolerance=0.1,
+        gap_threshold="2min",
+        resample=ResampleConfig(enabled=True, interval="1min"),
+    )
+    return SimpleNamespace(
+        split=synthetic_windows_split_config, scaling=scaling, windowing=windowing
+    )
+
+
+@pytest.fixture
+def synthetic_resample_raw_df() -> pd.DataFrame:
+    """Irregular sub-minute samples: minute bin 0 gets two samples (mean/max
+    aggregation is checkable), minute bins 1-4 get NONE (must resample to
+    NaN, never forward-filled), minute bin 5 gets one sample.
+    """
+    timestamps = pd.to_datetime(
+        [
+            "2020-01-01 00:00:10",
+            "2020-01-01 00:00:40",
+            "2020-01-01 00:05:00",
+        ]
+    )
+    return pd.DataFrame(
+        {"analog_a": [2.0, 4.0, 9.0], "digital_a": [0.0, 1.0, 1.0]},
+        index=timestamps,
+    )

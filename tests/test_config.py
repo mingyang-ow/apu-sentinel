@@ -42,6 +42,14 @@ BASE_YAML = {
         "analog_columns": ["TP2"],
         "passthrough_columns": ["COMP"],
     },
+    "windowing": {
+        "window_duration": "30min",
+        "train_stride": "5min",
+        "score_stride": "1min",
+        "gap_tolerance": 0.1,
+        "gap_threshold": "5min",
+        "resample": {"enabled": False, "interval": "10s"},
+    },
     "train": {"epochs": 1, "max_minutes": 1},
     "model": {},
 }

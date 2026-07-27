@@ -96,5 +96,42 @@ scaling:
   # binary 0/1 flag is meaningless and would distort it.
   passthrough_columns:
     [COMP, DV_eletric, Towers, MPG, LPS, Pressure_switch, Oil_level, Caudal_impulses]
+  # A computed scale below this is treated as zero -- e.g. a channel that is
+  # constant (or nearly so) across a fold's training slice -- and 1.0 is
+  # substituted instead of dividing by ~0. data/scaling.py logs a WARNING
+  # naming the channel and its computed scale when this fires.
+  zero_scale_epsilon: 1e-8
+
+windowing:
+  # Defaults chosen from the REAL dataset's measured sampling (see
+  # data/windows.py characterise_sampling()): modal inter-sample interval is
+  # ~10s (1,516,948 rows over ~213 days), so a 30min window is ~180 samples
+  # -- long enough to see a full compressor on/off cycle, short enough to
+  # keep well under the 24h embargo (data/windows.py raises if this cap is
+  # violated).
+  window_duration: 30min
+  # Coarser than score_stride -- training tolerates less redundancy between
+  # windows, and it keeps the training tensor smaller (~30min / 5min = 6x
+  # fewer windows than stride-1-minute).
+  train_stride: 5min
+  # Finer than train_stride -- scoring wants scores mapped back to
+  # timestamps densely (one every minute) so episode grouping isn't coarse.
+  score_stride: 1min
+  # 10% wall-clock slack before a window is dropped for spanning a gap --
+  # generous enough to absorb the dataset's normal +/-1-3s sampling jitter
+  # (measured: 9-13s intervals dominate, not a clean, unwavering 10s) without
+  # tolerating a real gap.
+  gap_tolerance: 0.1
+  # What counts as a "gap" when characterising raw sampling (separate from
+  # gap_tolerance's per-window drop decision) -- the real data has 275 such
+  # gaps, the largest ~2 days (the documented failure/maintenance periods
+  # and a handful of other recording interruptions).
+  gap_threshold: 5min
+  resample:
+    # OFF by default -- a knowing modeling choice made after reviewing
+    # characterise_sampling()'s output, not an automatic default.
+    enabled: false
+    # Matches the measured modal interval if enabled.
+    interval: 10s
 
 model: {}

@@ -12,6 +12,7 @@ MetroPT-3 dataset.
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from apu_sentinel.data import scaling as scaling_module
@@ -163,3 +164,27 @@ def test_digital_columns_pass_through_and_unlisted_column_raises(
         fit_scaler(with_extra_column, synthetic_scaling_settings)
     with pytest.raises(ValueError):
         transform(with_extra_column, scaler)
+
+
+def test_constant_channel_gets_epsilon_guarded_scale_and_logs_warning(
+    synthetic_scaling_settings, caplog
+):
+    index = pd.date_range("2020-01-01", periods=10, freq="1h")
+    train = pd.DataFrame(
+        {"channel_0": [5.0] * len(index), "flag_0": [1.0] * len(index)},
+        index=index,
+    )
+
+    with caplog.at_level("WARNING"):
+        scaler = fit_scaler(train, synthetic_scaling_settings)
+
+    assert scaler.center_["channel_0"] == pytest.approx(5.0)
+    assert scaler.scale_["channel_0"] == pytest.approx(1.0)
+
+    transformed = transform(train, scaler)
+    assert np.isfinite(transformed["channel_0"].to_numpy()).all()
+
+    assert any(
+        "channel_0" in record.message and "computed scale" in record.message
+        for record in caplog.records
+    )

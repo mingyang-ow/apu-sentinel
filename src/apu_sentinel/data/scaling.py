@@ -39,10 +39,13 @@ supported alternatives, selected via config, never hardcoded.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 VALID_METHODS = ("robust", "standard", "minmax")
 
@@ -117,7 +120,17 @@ def fit_scaler(train_df: pd.DataFrame, settings) -> FoldScaler:
             c = float(values.min())
             s = float(values.max() - values.min())
         center[col] = c
-        scale[col] = s if s != 0 else 1.0  # constant column -- center only, no divide-by-zero
+        if abs(s) < settings.scaling.zero_scale_epsilon:
+            logger.warning(
+                "channel %r: computed scale %.3g is below zero_scale_epsilon "
+                "%.3g (constant/near-constant in this fold's training slice) "
+                "-- substituting scale=1.0 to avoid dividing by ~0.",
+                col,
+                s,
+                settings.scaling.zero_scale_epsilon,
+            )
+            s = 1.0
+        scale[col] = s
 
     return FoldScaler(
         method=method,

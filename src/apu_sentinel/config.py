@@ -118,6 +118,47 @@ class ScalingConfig(BaseModel):
     method: Literal["robust", "standard", "minmax"] = "robust"
     analog_columns: list[str]
     passthrough_columns: list[str]
+    # A computed scale below this is treated as zero (constant/near-constant
+    # channel) -- substituted with 1.0 rather than dividing by ~0. See
+    # data/scaling.py fit_scaler().
+    zero_scale_epsilon: float = 1e-8
+
+
+class ResampleConfig(BaseModel):
+    """Resampling to a regular grid -- OFF by default. Enabling it is a
+    modeling decision the user should make knowingly after reviewing
+    data/windows.py characterise_sampling()'s output, not an automatic
+    default.
+    """
+
+    model_config = _STRICT
+
+    enabled: bool = False
+    # Pandas duration string (e.g. "1min"), parsed downstream in
+    # data/windows.py -- never hardcoded there.
+    interval: str = "1min"
+
+
+class WindowingConfig(BaseModel):
+    """Durations are pandas duration strings (e.g. "30min"), parsed to
+    pd.Timedelta in data/windows.py and converted to a sample count using
+    the empirically measured expected_interval -- never a hardcoded sample
+    count here.
+    """
+
+    model_config = _STRICT
+
+    window_duration: str
+    train_stride: str
+    score_stride: str
+    # Fractional slack on a window's expected wall-clock span before it is
+    # dropped for spanning a gap.
+    gap_tolerance: float = 0.1
+    # What counts as a "gap" when characterise_sampling() reports on the
+    # raw sampling (a separate concern from gap_tolerance, which governs
+    # per-window drop decisions).
+    gap_threshold: str
+    resample: ResampleConfig = Field(default_factory=ResampleConfig)
 
 
 class Settings(BaseSettings):
@@ -130,6 +171,7 @@ class Settings(BaseSettings):
     split: SplitConfig
     evaluation: EvaluationConfig
     scaling: ScalingConfig
+    windowing: WindowingConfig
     train: TrainConfig
     model: dict = Field(default_factory=dict)
 
