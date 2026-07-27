@@ -12,7 +12,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from apu_sentinel.config import EvaluationConfig, FailureEvent, SplitConfig, TrainingExclusionConfig
+from apu_sentinel.config import (
+    EvaluationConfig,
+    FailureEvent,
+    ScalingConfig,
+    SplitConfig,
+    TrainingExclusionConfig,
+)
+from apu_sentinel.data.split import _exclusion_window
 
 
 @pytest.fixture
@@ -67,6 +74,46 @@ def out_of_order_raw_csv(tmp_path: Path) -> Path:
     df.loc[[2, 3]] = df.loc[[3, 2]].to_numpy()
     path = tmp_path / "out_of_order_raw.csv"
     df.to_csv(path, index=False)
+    return path
+
+
+def _tiny_raw_frame_all_channels() -> pd.DataFrame:
+    """Shaped like the real MetroPT-3 raw CSV: timestamp + all 7 analog +
+    8 digital channels -- used to prove the loader's column set is exactly
+    this after dropping the unnamed-index serialisation artifact.
+    """
+    n = 4
+    return pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2020-01-01", periods=n, freq="1min"),
+            "TP2": [1.0, 1.1, 1.2, 1.3],
+            "TP3": [9.0, 9.1, 9.2, 9.3],
+            "H1": [9.0, 9.0, 9.0, 9.0],
+            "DV_pressure": [0.0, 0.0, 0.0, 0.0],
+            "Reservoirs": [9.0, 9.0, 9.0, 9.0],
+            "Oil_temperature": [53.0, 53.1, 53.2, 53.3],
+            "Motor_current": [0.04, 0.04, 0.04, 0.04],
+            "COMP": [1.0, 1.0, 1.0, 1.0],
+            "DV_eletric": [0.0, 0.0, 0.0, 0.0],
+            "Towers": [1.0, 1.0, 1.0, 1.0],
+            "MPG": [1.0, 1.0, 1.0, 1.0],
+            "LPS": [0.0, 0.0, 0.0, 0.0],
+            "Pressure_switch": [1.0, 1.0, 1.0, 1.0],
+            "Oil_level": [1.0, 1.0, 1.0, 1.0],
+            "Caudal_impulses": [1.0, 1.0, 1.0, 1.0],
+        }
+    )
+
+
+@pytest.fixture
+def raw_csv_with_unnamed_index_column(tmp_path: Path) -> Path:
+    """Raw CSV written WITH its pandas integer index (index=True) -- the
+    "Unnamed: 0" artifact produced when a CSV is written with its index and
+    re-read without index_col, as apparently happened for the real
+    MetroPT-3 raw file.
+    """
+    path = tmp_path / "raw_with_unnamed_index.csv"
+    _tiny_raw_frame_all_channels().to_csv(path, index=True)
     return path
 
 
@@ -137,6 +184,25 @@ def synthetic_split_settings_overlapping(synthetic_split_events, synthetic_train
 
 
 @pytest.fixture
+def synthetic_split_settings_test_start_overlap(
+    synthetic_split_events, synthetic_training_exclusion
+):
+    """A width (134h) that passes the plain window-width overlap check
+    (label_start for event 3 lands just after event 2's exclusion ends,
+    136h max) but violates the TIGHTER test_start check, which also backs
+    off by embargo_hours (4h) -- exactly the previously-unguarded gap this
+    pass closes. Reproduces it with a small margin rather than the exact
+    real-dataset 2h/22h numbers, but the same shape of bug.
+    """
+    split = SplitConfig(embargo_hours=4, training_exclusion=synthetic_training_exclusion)
+    evaluation = EvaluationConfig(
+        window_widths=[6, 12, 24, 48, 134],
+        failure_events=synthetic_split_events,
+    )
+    return SimpleNamespace(split=split, evaluation=evaluation)
+
+
+@pytest.fixture
 def synthetic_split_data_bounds() -> tuple[pd.Timestamp, pd.Timestamp]:
     return pd.Timestamp("2019-12-01 00:00"), pd.Timestamp("2020-02-05 00:00")
 
@@ -151,4 +217,53 @@ def synthetic_split_df(synthetic_split_data_bounds) -> pd.DataFrame:
     rng = np.random.default_rng(0)
     df = pd.DataFrame({"channel_0": rng.normal(size=len(index))}, index=index)
     df.index.name = "timestamp"
+    return df
+
+
+# --- Fixtures for tests/test_scaler_train_only.py -----------------------
+
+
+@pytest.fixture
+def synthetic_scaling_config() -> ScalingConfig:
+    return ScalingConfig(
+        method="robust",
+        analog_columns=["channel_0"],
+        passthrough_columns=["flag_0"],
+    )
+
+
+@pytest.fixture
+def synthetic_scaling_settings(synthetic_split_settings, synthetic_scaling_config):
+    """Duck-typed like apu_sentinel.config.Settings: exposes .split,
+    .evaluation, and .scaling.
+    """
+    return SimpleNamespace(
+        split=synthetic_split_settings.split,
+        evaluation=synthetic_split_settings.evaluation,
+        scaling=synthetic_scaling_config,
+    )
+
+
+@pytest.fixture
+def synthetic_scaling_df(
+    synthetic_split_data_bounds, synthetic_split_events, synthetic_training_exclusion
+) -> pd.DataFrame:
+    """Like synthetic_split_df, but with an extreme spike planted inside
+    EVERY event's training-exclusion window, so "fit including the
+    exclusion" vs. "fit on the clean, exclusion-removed slice" produce
+    measurably different statistics -- proving contamination is actually
+    prevented, not just that exclusions are recorded.
+    """
+    data_start, data_end = synthetic_split_data_bounds
+    index = pd.date_range(data_start, data_end, freq="1h")
+    rng = np.random.default_rng(0)
+    channel_0 = rng.normal(loc=0.0, scale=1.0, size=len(index))
+    flag_0 = rng.integers(0, 2, size=len(index)).astype(float)
+    df = pd.DataFrame({"channel_0": channel_0, "flag_0": flag_0}, index=index)
+    df.index.name = "timestamp"
+
+    for event in synthetic_split_events:
+        excl_start, excl_end = _exclusion_window(event, synthetic_training_exclusion)
+        mask = (df.index >= excl_start) & (df.index < excl_end)
+        df.loc[mask, "channel_0"] = 10_000.0
     return df

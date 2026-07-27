@@ -29,6 +29,17 @@ def load_raw(path: Path, timestamp_column: str = "timestamp") -> pd.DataFrame:
     path = Path(path)
     df = pd.read_csv(path)
 
+    unnamed_columns = [c for c in df.columns if c.startswith("Unnamed:")]
+    if unnamed_columns:
+        logger.warning(
+            "%s: dropping unnamed column(s) %s -- pandas' auto-generated name "
+            "for an index column that was written into the CSV (a "
+            "serialisation artifact, not a sensor channel).",
+            path,
+            unnamed_columns,
+        )
+        df = df.drop(columns=unnamed_columns)
+
     if timestamp_column not in df.columns:
         raise ValueError(
             f"Expected timestamp column '{timestamp_column}' not found in {path} "

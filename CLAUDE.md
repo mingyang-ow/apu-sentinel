@@ -16,7 +16,8 @@ code runs locally (CPU, small subset) and on Colab (GPU, full data);
 behaviour is selected by CONFIG, never by editing code. Env & deps managed by
 uv; Python 3.11.
 
-- data/       loading, TIME-BASED splitting, windowing + scaling
+- data/       loading, TIME-BASED splitting (split.py), per-fold fit-on-train-only
+              scaling (scaling.py), windowing (windows.py)
 - regimes/    operating-state segmentation (compressor on/off cycles)
 - features/   feature engineering
 - models/     all models implement the models/base.py interface

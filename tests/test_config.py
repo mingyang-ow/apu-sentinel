@@ -37,6 +37,11 @@ BASE_YAML = {
         "false_alarm_ceiling": None,
         "failure_events": [],
     },
+    "scaling": {
+        "method": "robust",
+        "analog_columns": ["TP2"],
+        "passthrough_columns": ["COMP"],
+    },
     "train": {"epochs": 1, "max_minutes": 1},
     "model": {},
 }

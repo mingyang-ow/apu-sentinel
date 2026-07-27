@@ -40,10 +40,13 @@ split:
 evaluation:
   # SWEPT list of candidate pre-failure window widths (hours). A project
   # result, not a single magic number -- see CLAUDE.md "pre-failure window
-  # width". Widest value (96h / 4 days) is capped by the event-2/event-3
-  # proximity constraint (~118h gap given the margins above) -- data/split.py
-  # raises loudly if this cap is violated.
-  window_widths: [6, 12, 24, 48, 72, 96]
+  # width". Widest value (72h / 3 days) is capped by the event-2/event-3
+  # proximity constraint: event 2's exclusion region ends ~118h before event
+  # 3 starts, and test_start also backs off by embargo_hours (24h) on top of
+  # the widest window, tightening the true cap to ~94h -- data/split.py
+  # raises loudly (on either the window-width or the test-start overlap
+  # check) if this cap is violated.
+  window_widths: [6, 12, 24, 48, 72]
   # Hysteresis / hold-time (seconds) used to group flagged timestamps into
   # one episode.
   episode_hold_time: null
@@ -78,5 +81,20 @@ evaluation:
       start: "2020-07-15 14:30"
       end:   "2020-07-15 19:00"
       maintenance: "2020-07-16 00:00"
+
+scaling:
+  # robust (median / IQR) is the DEFAULT: training data still contains
+  # UNREPORTED anomalies -- only the four documented events above can be
+  # excluded -- so location/spread estimates should resist the outliers
+  # that remain. standard/minmax are supported alternatives, chosen here,
+  # never hardcoded in data/scaling.py.
+  method: robust
+  # The 7 analog sensor channels -- scaled.
+  analog_columns:
+    [TP2, TP3, H1, DV_pressure, Reservoirs, Oil_temperature, Motor_current]
+  # The 8 digital/status channels -- passed through bit-identical; scaling a
+  # binary 0/1 flag is meaningless and would distort it.
+  passthrough_columns:
+    [COMP, DV_eletric, Towers, MPG, LPS, Pressure_switch, Oil_level, Caudal_impulses]
 
 model: {}

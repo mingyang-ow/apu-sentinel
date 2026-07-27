@@ -26,3 +26,38 @@ def test_load_raw_surfaces_out_of_order_timestamps(out_of_order_raw_csv: Path, c
     assert any("NOT monotonic" in record.message for record in caplog.records)
     # still returns a sorted frame -- the disorder is reported, not hidden
     assert df.index.is_monotonic_increasing
+
+
+def test_load_raw_drops_unnamed_index_column_and_logs(
+    raw_csv_with_unnamed_index_column: Path, caplog
+):
+    with caplog.at_level("WARNING"):
+        df = load_raw(raw_csv_with_unnamed_index_column)
+
+    assert not any(col.startswith("Unnamed:") for col in df.columns)
+    assert any(
+        "Unnamed" in record.message and "serialisation artifact" in record.message
+        for record in caplog.records
+    )
+
+    analog_columns = {
+        "TP2",
+        "TP3",
+        "H1",
+        "DV_pressure",
+        "Reservoirs",
+        "Oil_temperature",
+        "Motor_current",
+    }
+    digital_columns = {
+        "COMP",
+        "DV_eletric",
+        "Towers",
+        "MPG",
+        "LPS",
+        "Pressure_switch",
+        "Oil_level",
+        "Caudal_impulses",
+    }
+    assert set(df.columns) == analog_columns | digital_columns
+    assert df.index.name == "timestamp"

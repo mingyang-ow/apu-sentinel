@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -107,6 +107,19 @@ class TrainConfig(BaseModel):
     max_minutes: int
 
 
+class ScalingConfig(BaseModel):
+    """Column selection is explicit and config-driven -- see
+    data/scaling.py. A DataFrame column absent from BOTH analog_columns and
+    passthrough_columns must raise, never be silently guessed at.
+    """
+
+    model_config = _STRICT
+
+    method: Literal["robust", "standard", "minmax"] = "robust"
+    analog_columns: list[str]
+    passthrough_columns: list[str]
+
+
 class Settings(BaseSettings):
     """Top-level, merged config for a single run."""
 
@@ -116,6 +129,7 @@ class Settings(BaseSettings):
     data: DataConfig
     split: SplitConfig
     evaluation: EvaluationConfig
+    scaling: ScalingConfig
     train: TrainConfig
     model: dict = Field(default_factory=dict)
 

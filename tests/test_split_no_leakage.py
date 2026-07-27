@@ -124,3 +124,18 @@ def test_overlap_detection_raises_naming_event_2_and_3(
     data_start, data_end = synthetic_split_data_bounds
     with pytest.raises(ValueError, match=r"event 3.*event 2|event 2.*event 3"):
         make_folds(synthetic_split_settings_overlapping, data_start, data_end)
+
+
+def test_test_start_overlap_detected_even_when_window_width_check_passes(
+    synthetic_split_settings_test_start_overlap, synthetic_split_data_bounds
+):
+    """The gap found in the split pass: a width can pass the plain
+    window-width overlap check (label_start lands just after the earlier
+    event's exclusion ends) while the fold's actual test_start -- which
+    backs off by an EXTRA embargo_hours on top of that width -- still opens
+    before the earlier event's exclusion region has ended. This must be
+    caught too, not just the label-window case.
+    """
+    data_start, data_end = synthetic_split_data_bounds
+    with pytest.raises(ValueError, match="test_start"):
+        make_folds(synthetic_split_settings_test_start_overlap, data_start, data_end)
