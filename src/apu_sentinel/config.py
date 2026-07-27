@@ -22,6 +22,11 @@ CONFIG_DIR = REPO_ROOT / "configs"
 
 VALID_CONFIG_NAMES = ("local", "colab")
 
+# data.* fields holding filesystem paths -- resolved to absolute (against
+# REPO_ROOT, not CWD) at load time so callers work regardless of where the
+# process was launched from (notebooks, Colab, scripts run from subdirs).
+_DATA_PATH_FIELDS = ("raw_dir", "interim_dir", "processed_dir")
+
 _STRICT = ConfigDict(extra="forbid")
 
 
@@ -38,23 +43,61 @@ class DataConfig(BaseModel):
     subset: float = 1.0
 
 
+class TrainingExclusionConfig(BaseModel):
+    """Fixed, generous margins purging training data around each failure.
+
+    Deliberately kept separate from evaluation.window_widths (the SWEPT
+    pre-failure label width) -- one must never be derived from the other.
+    All values in hours.
+    """
+
+    model_config = _STRICT
+
+    pre_margin_hours: float
+    post_settle_hours: float
+    # Used instead of post_settle_hours when an event's maintenance
+    # timestamp is unrecorded (null) -- see evaluation.failure_events.
+    fallback_post_hours: float
+
+
 class SplitConfig(BaseModel):
     model_config = _STRICT
 
-    # Time-based boundaries only -- see CLAUDE.md rule 1. Never a ratio.
-    train_end: str
-    val_end: str
+    # Gap enforced between a fold's train_end and test_start. Must be >=
+    # the longest sequence window any later windowing pass will use.
+    embargo_hours: float
+    training_exclusion: TrainingExclusionConfig
+
+
+class FailureEvent(BaseModel):
+    """One documented MetroPT-3 failure event. Timestamps are kept as
+    strings here (parsed to pd.Timestamp downstream in data/split.py),
+    matching the existing "timestamps as strings in config" convention.
+    """
+
+    model_config = _STRICT
+
+    id: int
+    start: str
+    end: str
+    # null when the source table has no maintenance/repair entry for this
+    # event (see event 1's note) -- callers must fall back to
+    # training_exclusion.fallback_post_hours in that case.
+    maintenance: str | None = None
+    note: str | None = None
 
 
 class EvaluationConfig(BaseModel):
     model_config = _STRICT
 
-    # SWEPT candidate pre-failure window widths (minutes) -- a reported
-    # result, not a single magic number.
-    window_widths: list[int] = Field(default_factory=list)
+    # SWEPT candidate pre-failure window widths (hours) -- a reported
+    # result, not a single magic number. The widest value must respect the
+    # event-2/event-3 proximity cap enforced by data/split.py.
+    window_widths: list[float] = Field(default_factory=list)
     episode_hold_time: int | None = None
     # Deferred until baseline behaviour has been observed.
     false_alarm_ceiling: float | None = None
+    failure_events: list[FailureEvent] = Field(default_factory=list)
 
 
 class TrainConfig(BaseModel):
@@ -82,6 +125,23 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         raise FileNotFoundError(f"Config file not found: {path}")
     with path.open() as f:
         return yaml.safe_load(f) or {}
+
+
+def _resolve_data_paths(data: dict[str, Any]) -> None:
+    """Resolve data.* path fields to absolute, in place, against REPO_ROOT.
+
+    Relative paths in configs/*.yaml (e.g. "data/raw") are meant relative to
+    the repo root, not whatever directory the process happens to be running
+    from. An already-absolute value (e.g. an experiment override) is left
+    untouched.
+    """
+    for field in _DATA_PATH_FIELDS:
+        value = data.get(field)
+        if value is None:
+            continue
+        path = Path(value)
+        if not path.is_absolute():
+            data[field] = str((REPO_ROOT / path).resolve())
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -112,6 +172,10 @@ def load_config(
     (the safe CPU/subset default). Raises ValueError for an unrecognized
     name.
 
+    data.* path fields (raw_dir, interim_dir, processed_dir) are resolved to
+    absolute paths against the repo root before validation, so callers work
+    regardless of the process's current working directory.
+
     The merged dict is validated through the Settings schema -- a wrong
     type or unknown key fails here, loudly, rather than later in a training
     loop.
@@ -134,5 +198,8 @@ def load_config(
 
     if experiment is not None:
         merged = _deep_merge(merged, _load_yaml(config_dir / "experiment" / f"{experiment}.yaml"))
+
+    if "data" in merged:
+        _resolve_data_paths(merged["data"])
 
     return Settings(**merged)

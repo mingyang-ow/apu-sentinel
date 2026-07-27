@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from apu_sentinel.config import Settings, load_config
+from apu_sentinel.config import REPO_ROOT, Settings, load_config
 
 BASE_YAML = {
     "device": "cpu",
@@ -24,13 +24,18 @@ BASE_YAML = {
         "checksum": None,
     },
     "split": {
-        "train_end": "2020-06-01T00:00:00",
-        "val_end": "2020-07-01T00:00:00",
+        "embargo_hours": 24,
+        "training_exclusion": {
+            "pre_margin_hours": 24,
+            "post_settle_hours": 24,
+            "fallback_post_hours": 48,
+        },
     },
     "evaluation": {
         "window_widths": [],
         "episode_hold_time": None,
         "false_alarm_ceiling": None,
+        "failure_events": [],
     },
     "train": {"epochs": 1, "max_minutes": 1},
     "model": {},
@@ -71,7 +76,7 @@ def test_deep_merge_retains_base_keys_env_overrides_one(config_dir: Path):
     settings = load_config("local", config_dir=config_dir)
 
     assert settings.data.url == BASE_YAML["data"]["url"]
-    assert settings.data.raw_dir == Path(BASE_YAML["data"]["raw_dir"])
+    assert settings.data.raw_dir == REPO_ROOT / BASE_YAML["data"]["raw_dir"]
     assert settings.data.raw_filename == BASE_YAML["data"]["raw_filename"]
     assert settings.data.checksum is None
     assert settings.data.subset == 0.05
@@ -85,7 +90,7 @@ def test_precedence_base_env_experiment(config_dir: Path):
     # base + colab set train.max_minutes, no experiment override -- colab wins
     assert settings.train.max_minutes == 120
     # base-only key, untouched by colab or experiment
-    assert settings.split.train_end == BASE_YAML["split"]["train_end"]
+    assert settings.split.embargo_hours == BASE_YAML["split"]["embargo_hours"]
 
 
 def test_config_selection_local_vs_colab(config_dir: Path):
@@ -124,3 +129,21 @@ def test_validation_failure_on_wrong_type(config_dir: Path):
 def test_load_config_returns_typed_settings(config_dir: Path):
     settings = load_config("local", config_dir=config_dir)
     assert isinstance(settings, Settings)
+
+
+def test_data_paths_are_absolute_regardless_of_cwd(config_dir: Path, monkeypatch, tmp_path: Path):
+    """raw_dir/interim_dir/processed_dir must resolve against the repo root,
+    not the process's CWD -- notebooks and scripts run from anywhere.
+    """
+    other_cwd = tmp_path / "somewhere" / "else"
+    other_cwd.mkdir(parents=True)
+    monkeypatch.chdir(other_cwd)
+
+    settings = load_config("local", config_dir=config_dir)
+
+    for path in (settings.data.raw_dir, settings.data.interim_dir, settings.data.processed_dir):
+        assert path.is_absolute()
+
+    assert settings.data.raw_dir == REPO_ROOT / BASE_YAML["data"]["raw_dir"]
+    assert settings.data.interim_dir == REPO_ROOT / BASE_YAML["data"]["interim_dir"]
+    assert settings.data.processed_dir == REPO_ROOT / BASE_YAML["data"]["processed_dir"]

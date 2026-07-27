@@ -15,20 +15,68 @@ data:
   checksum: null
 
 split:
-  # Time-based boundaries ONLY. Never a shuffle ratio -- see CLAUDE.md rule 1.
-  train_end: "<timestamp, e.g. 2020-06-01T00:00:00>"
-  val_end: "<timestamp, e.g. 2020-07-01T00:00:00>"
+  # Walk-forward (expanding-window) scheme -- see data/split.py. Never a
+  # shuffle/ratio split -- CLAUDE.md rule 1.
+  #
+  # Gap enforced between a fold's train_end and test_start, so that a
+  # sliding window straddling the boundary can't pull test-period data into
+  # a training sample. Must be >= the longest sequence window any later
+  # windowing pass uses; no window length is chosen yet, so this is a
+  # generous placeholder the user will raise if a longer window is picked.
+  embargo_hours: 24
+  training_exclusion:
+    # Purge training data from failure onset minus this margin -- covers
+    # the ramp-up into a failure, which is not "normal" behaviour to train
+    # on.
+    pre_margin_hours: 24
+    # ...through maintenance/repair plus this many hours -- a compressor
+    # needs time to settle into normal operation after a repair.
+    post_settle_hours: 24
+    # Used instead of post_settle_hours when maintenance is unrecorded
+    # (event 1 below has no maintenance entry) -- more conservative since
+    # the actual repair/settle time is unknown.
+    fallback_post_hours: 48
 
 evaluation:
-  # SWEPT list of candidate pre-failure window widths (minutes). A project
+  # SWEPT list of candidate pre-failure window widths (hours). A project
   # result, not a single magic number -- see CLAUDE.md "pre-failure window
-  # width".
-  window_widths: []
+  # width". Widest value (96h / 4 days) is capped by the event-2/event-3
+  # proximity constraint (~118h gap given the margins above) -- data/split.py
+  # raises loudly if this cap is violated.
+  window_widths: [6, 12, 24, 48, 72, 96]
   # Hysteresis / hold-time (seconds) used to group flagged timestamps into
   # one episode.
   episode_hold_time: null
   # DEFERRED until baseline behaviour has been observed -- do not set before
   # then.
   false_alarm_ceiling: null
+  # Documented MetroPT-3 failure events (UCI dataset 791 failure reports).
+  # All four are Air leak / High stress. Notes are part of the documented
+  # label-construction decision (CLAUDE.md "Labels are derived, documented,
+  # versioned") -- do not strip them.
+  failure_events:
+    - id: 1
+      start: "2020-04-18 00:00"
+      end:   "2020-04-18 23:59"
+      maintenance: null
+      note: "No maintenance entry in the source table; repair time unknown."
+    - id: 2
+      start: "2020-05-29 23:30"
+      end:   "2020-05-30 06:00"
+      maintenance: "2020-05-30 12:00"
+      note: >
+        Source table prints 'Maintenance on 30Apr at 12:00', which predates the
+        failure by a month and contradicts the pattern of every other row
+        (repair follows failure by hours). Treated as a typo for 30 May 12:00.
+        Documented deviation from source.
+    - id: 3
+      start: "2020-06-05 10:00"
+      end:   "2020-06-07 14:30"
+      maintenance: "2020-06-08 16:00"
+      note: "Source table also mislabels event 2 as '#1'; ids here are sequential."
+    - id: 4
+      start: "2020-07-15 14:30"
+      end:   "2020-07-15 19:00"
+      maintenance: "2020-07-16 00:00"
 
 model: {}

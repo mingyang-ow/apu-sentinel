@@ -6,10 +6,13 @@ belongs.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
+
+from apu_sentinel.config import EvaluationConfig, FailureEvent, SplitConfig, TrainingExclusionConfig
 
 
 @pytest.fixture
@@ -65,3 +68,87 @@ def out_of_order_raw_csv(tmp_path: Path) -> Path:
     path = tmp_path / "out_of_order_raw.csv"
     df.to_csv(path, index=False)
     return path
+
+
+# --- Fixtures for tests/test_split_no_leakage.py -----------------------
+#
+# Three synthetic events shaped like the real MetroPT-3 four (id 1 has no
+# maintenance entry; the gap between event 1 and event 2 is large, the gap
+# between event 2 and event 3 is tight -- ~136h -- mirroring the real
+# event-2/event-3 proximity constraint documented in data/split.py).
+
+
+@pytest.fixture
+def synthetic_split_events() -> list[FailureEvent]:
+    return [
+        FailureEvent(
+            id=1,
+            start="2020-01-02 00:00",
+            end="2020-01-02 04:00",
+            maintenance=None,
+            note="synthetic: no maintenance recorded, like real event 1",
+        ),
+        FailureEvent(
+            id=2,
+            start="2020-01-20 00:00",
+            end="2020-01-20 06:00",
+            maintenance="2020-01-20 12:00",
+        ),
+        FailureEvent(
+            id=3,
+            start="2020-01-26 10:00",
+            end="2020-01-28 14:00",
+            maintenance="2020-01-29 16:00",
+        ),
+    ]
+
+
+@pytest.fixture
+def synthetic_training_exclusion() -> TrainingExclusionConfig:
+    return TrainingExclusionConfig(pre_margin_hours=2, post_settle_hours=6, fallback_post_hours=12)
+
+
+@pytest.fixture
+def synthetic_split_settings(synthetic_split_events, synthetic_training_exclusion):
+    """Duck-typed like apu_sentinel.config.Settings: exposes .split and
+    .evaluation. window_widths max out at 48h -- safely under the ~136h
+    event-2/event-3 gap given the margins above.
+    """
+    split = SplitConfig(embargo_hours=4, training_exclusion=synthetic_training_exclusion)
+    evaluation = EvaluationConfig(
+        window_widths=[6, 12, 24, 48],
+        failure_events=synthetic_split_events,
+    )
+    return SimpleNamespace(split=split, evaluation=evaluation)
+
+
+@pytest.fixture
+def synthetic_split_settings_overlapping(synthetic_split_events, synthetic_training_exclusion):
+    """Same as synthetic_split_settings but with a deliberately over-wide
+    150h window width -- wider than the ~136h event-2/event-3 gap, so
+    make_folds() must raise naming that pair.
+    """
+    split = SplitConfig(embargo_hours=4, training_exclusion=synthetic_training_exclusion)
+    evaluation = EvaluationConfig(
+        window_widths=[6, 12, 24, 48, 150],
+        failure_events=synthetic_split_events,
+    )
+    return SimpleNamespace(split=split, evaluation=evaluation)
+
+
+@pytest.fixture
+def synthetic_split_data_bounds() -> tuple[pd.Timestamp, pd.Timestamp]:
+    return pd.Timestamp("2019-12-01 00:00"), pd.Timestamp("2020-02-05 00:00")
+
+
+@pytest.fixture
+def synthetic_split_df(synthetic_split_data_bounds) -> pd.DataFrame:
+    """Small hourly synthetic series spanning synthetic_split_events, for
+    materialising and checking actual fold slices (not just boundaries).
+    """
+    data_start, data_end = synthetic_split_data_bounds
+    index = pd.date_range(data_start, data_end, freq="1h")
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame({"channel_0": rng.normal(size=len(index))}, index=index)
+    df.index.name = "timestamp"
+    return df
