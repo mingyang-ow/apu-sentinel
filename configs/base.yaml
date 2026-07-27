@@ -47,9 +47,34 @@ evaluation:
   # raises loudly (on either the window-width or the test-start overlap
   # check) if this cap is violated.
   window_widths: [6, 12, 24, 48, 72]
-  # Hysteresis / hold-time (seconds) used to group flagged timestamps into
-  # one episode.
-  episode_hold_time: null
+  # Alert threshold is a high quantile of TRAINING scores only (see
+  # evaluation/metrics.py fit_threshold) -- never a hardcoded score value,
+  # never fit on test scores.
+  threshold_quantile: 0.995
+  # Optional sweep -- fit_threshold_sweep() fits every one of these on
+  # train scores and returns the whole curve of results; the test-optimal
+  # point must never be hand-picked and reported as "the" result.
+  threshold_quantiles: [0.99, 0.995, 0.999]
+  # Hysteresis / hold-time used to group flagged timestamps into one
+  # episode: a below-threshold stretch shorter than this does not end it.
+  # A few multiples of windowing.score_stride (1min) -- long enough to
+  # absorb a brief dip without being so generous it merges genuinely
+  # separate episodes.
+  episode_hold_time: 10min
+  # A gap in the score timeline (windows dropped for spanning a data gap --
+  # see data/windows.py) longer than this ENDS an episode outright,
+  # regardless of episode_hold_time -- absence of evidence is not evidence
+  # of continuation. Deliberately wider than episode_hold_time so the two
+  # rules stay distinguishable.
+  score_gap_threshold: 30min
+  # OFF by default (0 = no minimum) -- enabling a minimum episode duration
+  # to drop blips is a knowing choice made after seeing baseline behaviour.
+  min_episode_duration: 0min
+  # How per-timestamp channel contributions are aggregated across an
+  # episode's timestamps into its ranked diagnosis (explain/). mean is the
+  # default so one momentary spike on an otherwise-quiet channel doesn't
+  # dominate the ranking; max is available for the opposite judgement call.
+  contribution_aggregation: mean
   # DEFERRED until baseline behaviour has been observed -- do not set before
   # then.
   false_alarm_ceiling: null
@@ -81,6 +106,9 @@ evaluation:
       start: "2020-07-15 14:30"
       end:   "2020-07-15 19:00"
       maintenance: "2020-07-16 00:00"
+  # Extra masked regions beyond the automatic per-event ones (e.g. a known
+  # sensor outage unrelated to a documented failure) -- none identified yet.
+  additional_masked_regions: []
 
 scaling:
   # robust (median / IQR) is the DEFAULT: training data still contains
@@ -133,5 +161,61 @@ windowing:
     enabled: false
     # Matches the measured modal interval if enabled.
     interval: 10s
+
+regimes:
+  # Cross-referenced in regimes.verify_flag_semantics against Motor_current:
+  # COMP and MPG track each other almost perfectly (>99.5% agreement on the
+  # real data) and DV_eletric is their near-perfect inverse. COMP is used as
+  # the deciding flag in `states` below since it is the documented control
+  # signal; the other two are kept here purely so verify_flag_semantics can
+  # report their agreement rate as evidence, not to vote.
+  control_columns: [COMP, DV_eletric, MPG]
+  # Empirically derived, NOT assumed -- see the pass-9 write-up. COMP=1 and
+  # MPG=1 correlate with near-zero Motor_current (OFF); DV_eletric=1
+  # correlates with high Motor_current (ON). This is the OPPOSITE of the
+  # naive reading of COMP as "compressor running" -- the source
+  # documentation's own hint (COMP active = no air intake) is correct.
+  polarity:
+    COMP: { 1: "OFF", 0: "ON" }
+    DV_eletric: { 1: "ON", 0: "OFF" }
+    MPG: { 1: "OFF", 0: "ON" }
+  # LOADED (COMP=0) is the only flag-defined state. Rows NOT matching this
+  # (COMP=1, "no air intake") are further split into OFFLOAD/STOPPED below
+  # -- a third state is empirically real within COMP=1 (~35% of that time,
+  # sustained ~400s runs, Motor_current ~3.5-4.3A vs ~0A for true OFF), but
+  # NO digital flag combination resolves it (see docs/FINDINGS.md §7) --
+  # defining it via a flag condition would mean clustering the analog
+  # signal by another name, exactly what this module's docstring warns
+  # against. Splitting explicitly by Motor_current below is a deliberate,
+  # documented exception, not a silent one.
+  states:
+    LOADED: { COMP: 0 }
+  # Channel + threshold splitting the non-LOADED group into OFFLOAD (>=
+  # threshold) vs STOPPED (< threshold). Only 0.015% of OFF samples fall in
+  # the 1-3A valley between the two modes (docs/FINDINGS.md §7) -- 2.0A
+  # sits in genuine emptiness, not an arbitrary cut point.
+  offload_split_channel: Motor_current
+  offload_current_threshold: 2.0
+  # A newly-changed raw state must persist this long (looking backward)
+  # before being committed -- a few multiples of the 10s sampling interval,
+  # short enough to only catch flag flicker (raw LOADED runs have a q25 of
+  # 0s -- i.e. plenty of single/two-sample noise blips), not real cycling.
+  min_duration: 30s
+  # Analog channels are still settling this long after a committed state
+  # change -- labelled TRANSITION rather than the new state. NOTE: an
+  # initial 60s guess (a "bit longer than min_duration") turned out to be
+  # badly miscalibrated against the observed run-length distribution: raw
+  # LOADED cycles have a median of only ~109s, so a 60s settle window
+  # swallowed almost an entire typical cycle. Revised down to 20s (2
+  # samples) so a typical committed LOADED run still has genuine
+  # steady-state time left after settling. Recorded here as a decision
+  # made FROM the evidence, not a first guess kept unexamined.
+  transition_settle: 20s
+  # Records the INTENT to optionally drop offload_split_channel
+  # (Motor_current) from scored channels while OFFLOAD/STOPPED, removing
+  # the circularity of using it both to DEFINE those states and to SCORE
+  # them (docs/FINDINGS.md §9). OFF by default -- a knowing choice, and NOT
+  # wired into scoring in this pass (scoring does not exist yet).
+  exclude_motor_current_when_off: false
 
 model: {}

@@ -87,6 +87,19 @@ class FailureEvent(BaseModel):
     note: str | None = None
 
 
+class MaskedRegionConfig(BaseModel):
+    """An explicitly configured region excluded from false-alarm counting,
+    in addition to the automatic per-event masked regions -- see
+    evaluation/events.py masked_regions().
+    """
+
+    model_config = _STRICT
+
+    start: str
+    end: str
+    note: str | None = None
+
+
 class EvaluationConfig(BaseModel):
     model_config = _STRICT
 
@@ -94,10 +107,36 @@ class EvaluationConfig(BaseModel):
     # result, not a single magic number. The widest value must respect the
     # event-2/event-3 proximity cap enforced by data/split.py.
     window_widths: list[float] = Field(default_factory=list)
-    episode_hold_time: int | None = None
+
+    # Threshold is fit on TRAINING scores ONLY (evaluation/metrics.py
+    # fit_threshold) -- a high quantile, never a hardcoded score value.
+    threshold_quantile: float = 0.995
+    # Optional sweep: fit_threshold_sweep() fits ALL of these on train
+    # scores and returns the whole curve -- picking the test-optimal one
+    # and reporting it as "the" result is forbidden (see fit_threshold_sweep
+    # docstring).
+    threshold_quantiles: list[float] = Field(default_factory=list)
+
+    # Hysteresis / hold-time: a below-threshold stretch shorter than this
+    # does not end an episode. Pandas duration string (e.g. "10min").
+    episode_hold_time: str = "10min"
+    # A gap in the score timeline (from dropped windows) longer than this
+    # ENDS an episode outright, regardless of episode_hold_time -- absence
+    # of evidence is not evidence of continuation. Pandas duration string.
+    score_gap_threshold: str = "30min"
+    # Episodes shorter than this are dropped. "0min" (default) = OFF --
+    # enabling this is a knowing choice, not an automatic default.
+    min_episode_duration: str = "0min"
+    # How per-timestamp channel contributions are aggregated across an
+    # episode's timestamps into its ranked diagnosis (explain/).
+    contribution_aggregation: Literal["mean", "max"] = "mean"
+
     # Deferred until baseline behaviour has been observed.
     false_alarm_ceiling: float | None = None
     failure_events: list[FailureEvent] = Field(default_factory=list)
+    # Extra masked regions beyond the automatic per-event ones (e.g. a
+    # known sensor outage unrelated to a documented failure).
+    additional_masked_regions: list[MaskedRegionConfig] = Field(default_factory=list)
 
 
 class TrainConfig(BaseModel):
@@ -161,6 +200,55 @@ class WindowingConfig(BaseModel):
     resample: ResampleConfig = Field(default_factory=ResampleConfig)
 
 
+class RegimesConfig(BaseModel):
+    """Operating-regime segmentation, derived from the compressor's own
+    digital control signals -- NOT by clustering the analog channels (see
+    regimes/__init__.py). No hardcoded flag names, polarities, or durations
+    in code; all of it lives here.
+    """
+
+    model_config = _STRICT
+
+    # Cross-referenced against each other in regimes.verify_flag_semantics
+    # (their pairwise agreement rate, after normalising via `polarity`, is
+    # logged as evidence for which one to trust as the deciding flag).
+    control_columns: list[str]
+    # Empirically-derived (regimes.verify_flag_semantics): raw flag value ->
+    # normalised OFF/ON reading. Filled from evidence against Motor_current,
+    # NEVER assumed -- a naive reading can be exactly backwards (see the
+    # pass-9 write-up on COMP).
+    polarity: dict[str, dict[int, str]]
+    # Explicit condition -> state name: {state_name: {flag_name: required
+    # raw value}}. Checked in this dict's order; the first state whose
+    # listed flag(s) all match a row wins. Rows matching none of these
+    # (i.e. "no air intake") are further split into OFFLOAD/STOPPED below --
+    # see regimes/__init__.py.
+    states: dict[str, dict[str, int]]
+    # Channel + threshold used to split whatever doesn't match `states`
+    # into OFFLOAD (>= threshold) vs STOPPED (< threshold). 2.0A is the
+    # empirically-justified default -- see docs/FINDINGS.md §7: only
+    # 0.015% of OFF samples fall in the 1-3A valley between the two modes,
+    # so 2.0A sits in genuine emptiness, not an arbitrary split point.
+    offload_split_channel: str = "Motor_current"
+    offload_current_threshold: float = 2.0
+    # A newly-changed raw state is committed only once it has persisted (a
+    # backward-looking check) for at least this long -- shorter blips are
+    # absorbed into the preceding committed state, never emitted as their
+    # own regime. Pandas duration string.
+    min_duration: str
+    # Samples within this long of a committed state change are labelled
+    # TRANSITION rather than the new state, since analog channels are
+    # still settling. Pandas duration string.
+    transition_settle: str
+    # Records the INTENT to optionally drop offload_split_channel
+    # (Motor_current) from scored channels while in an OFFLOAD/STOPPED
+    # state, to remove the circularity of using it both to DEFINE those
+    # states and to SCORE them for anomalies (docs/FINDINGS.md §9). Default
+    # false so enabling it is a knowing choice. NOT wired into scoring --
+    # scoring does not exist yet.
+    exclude_motor_current_when_off: bool = False
+
+
 class Settings(BaseSettings):
     """Top-level, merged config for a single run."""
 
@@ -172,6 +260,7 @@ class Settings(BaseSettings):
     evaluation: EvaluationConfig
     scaling: ScalingConfig
     windowing: WindowingConfig
+    regimes: RegimesConfig
     train: TrainConfig
     model: dict = Field(default_factory=dict)
 

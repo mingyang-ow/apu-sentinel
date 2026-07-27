@@ -18,12 +18,21 @@ uv; Python 3.11.
 
 - data/       loading, TIME-BASED splitting (split.py), per-fold fit-on-train-only
               scaling (scaling.py), windowing (windows.py)
-- regimes/    operating-state segmentation (compressor on/off cycles)
+- regimes/    operating-state segmentation (compressor on/off cycles); produces
+              PER-TIMESTAMP labels only. Regime-conditional handling (scaling,
+              feature computation, etc.) must be applied per-timestamp BEFORE
+              windowing, not at the window level — a typical ON/LOADED run
+              (median ~99s) is far shorter than the 1800s (30min) window, so
+              there is no such thing as a window that belongs to one regime.
 - features/   feature engineering
 - models/     all models implement the models/base.py interface
 - evaluation/ failure-window labels + EPISODE-LEVEL metrics
 - explain/    per-channel reconstruction-error attribution (CORE)
 - pipeline.py ties stages together, config-driven
+
+Empirical findings from the data are recorded in `docs/FINDINGS.md` —
+consult it before making modelling decisions. It holds *what we learned*;
+this file holds *rules for how to build*.
 
 ## Hard rules — DO NOT violate
 
@@ -40,6 +49,16 @@ uv; Python 3.11.
    See metric below.
 6. Labels are derived, documented, versioned. Pre-failure windows come from
    documented failure dates; window width is SWEPT, not a magic number.
+7. `Motor_current` defines the STOPPED/OFFLOAD regime boundary
+   (`regimes.offload_current_threshold`) and is therefore PARTIALLY
+   SELF-REFERENTIAL if it is also scored for anomalies during OFF-derived
+   states: a fault on that channel could simultaneously distort the regime
+   label and the score. Mitigated (not eliminated) by the near-total
+   separation between the two modes (only 0.015% of OFF samples fall in
+   the 1-3A valley — see `docs/FINDINGS.md` §7), and optionally by
+   `regimes.exclude_motor_current_when_off`. Whenever Motor_current is
+   scored during an OFF-derived state, this must be documented at the call
+   site.
 
 ## The metric (what every model is scored on)
 
@@ -72,6 +91,16 @@ tuned against the few test failures — that is leakage). The detection-vs-
 lead-time tradeoff curve is a REPORTED RESULT of the project. Too short →
 warning too late to act on; too long → pre-failure label dilutes, detection
 degrades.
+
+The current sweep cap (72h) is a DATA-GEOMETRY CONSTRAINT — event 2 and
+event 3 are only 6 days 4 hours apart, so a wider window would swallow event
+2's post-repair recovery period into event 3's pre-failure label (see
+`data/split.py` and `docs/FINDINGS.md` §4/§8). It is NOT a domain judgement
+that 72h is the right actionable lead time — `docs/FINDINGS.md` §8 shows
+event 2's cycle-timing precursor is visible ~10 days out, well past this
+cap. Raising the cap requires either per-event window widths or masking the
+event-2/event-3 overlap from false-alarm counting (the evaluation harness
+already supports masking) — not a claim that 72h is domain-correct.
 
 ## Model progression (each stage complete + beats the last before the next)
 

@@ -15,6 +15,7 @@ import pytest
 from apu_sentinel.config import (
     EvaluationConfig,
     FailureEvent,
+    RegimesConfig,
     ResampleConfig,
     ScalingConfig,
     SplitConfig,
@@ -459,3 +460,91 @@ def synthetic_resample_raw_df() -> pd.DataFrame:
         {"analog_a": [2.0, 4.0, 9.0], "digital_a": [0.0, 1.0, 1.0]},
         index=timestamps,
     )
+
+
+# --- Fixtures for tests/test_metrics.py and tests/test_eval_contract.py --
+#
+# One failure event with a short, easy-to-hand-compute settle tail
+# (post_settle_hours=2h), used across most episode-categorisation tests.
+
+
+@pytest.fixture
+def metrics_training_exclusion() -> TrainingExclusionConfig:
+    return TrainingExclusionConfig(pre_margin_hours=1, post_settle_hours=2, fallback_post_hours=4)
+
+
+@pytest.fixture
+def metrics_event() -> FailureEvent:
+    return FailureEvent(
+        id=1,
+        start="2020-01-10 00:00",
+        end="2020-01-10 04:00",
+        maintenance="2020-01-10 08:00",
+    )
+
+
+@pytest.fixture
+def metrics_settings(metrics_event, metrics_training_exclusion):
+    """Duck-typed like apu_sentinel.config.Settings: exposes .split
+    (training_exclusion) and .evaluation. window_widths=[6] (hours) --
+    pre-failure window is [2020-01-09 18:00, 2020-01-10 00:00). The
+    event's masked settle tail is [2020-01-10 00:00, 2020-01-10 10:00]
+    (maintenance 08:00 + post_settle_hours 2h).
+    """
+    evaluation = EvaluationConfig(
+        window_widths=[6],
+        threshold_quantile=0.995,
+        threshold_quantiles=[0.99, 0.995],
+        episode_hold_time="10min",
+        score_gap_threshold="30min",
+        min_episode_duration="0min",
+        contribution_aggregation="mean",
+        failure_events=[metrics_event],
+        additional_masked_regions=[],
+    )
+    return SimpleNamespace(
+        split=SimpleNamespace(training_exclusion=metrics_training_exclusion),
+        evaluation=evaluation,
+    )
+
+
+@pytest.fixture
+def metrics_channel_names() -> tuple[str, ...]:
+    return ("chan_a", "chan_b", "chan_c")
+
+
+# --- Fixtures for tests/test_regimes.py ---------------------------------
+#
+# A single control flag COMP, polarity COMP=1 -> OFF / COMP=0 -> ON (mirrors
+# the real, empirically-verified MetroPT-3 polarity). states only defines
+# LOADED (COMP=0); COMP=1 rows fall through to the OFFLOAD/STOPPED current
+# threshold split, matching the real four-state scheme. min_duration=30s and
+# transition_settle=60s at a 10s cadence -> 3 and 6-7 samples respectively,
+# matching the real dataset's measured sampling interval. offload_current_
+# threshold=2.0 matches the real config's empirically-justified default.
+
+
+@pytest.fixture
+def regimes_scaling_config() -> ScalingConfig:
+    return ScalingConfig(method="robust", analog_columns=["Motor_current"], passthrough_columns=[])
+
+
+@pytest.fixture
+def regimes_config() -> RegimesConfig:
+    return RegimesConfig(
+        control_columns=["COMP"],
+        polarity={"COMP": {1: "OFF", 0: "ON"}},
+        states={"LOADED": {"COMP": 0}},
+        offload_split_channel="Motor_current",
+        offload_current_threshold=2.0,
+        min_duration="30s",
+        transition_settle="60s",
+    )
+
+
+@pytest.fixture
+def regimes_settings(regimes_scaling_config, regimes_config):
+    """Duck-typed like apu_sentinel.config.Settings: exposes .scaling and
+    .regimes.
+    """
+    return SimpleNamespace(scaling=regimes_scaling_config, regimes=regimes_config)

@@ -1,0 +1,357 @@
+# FINDINGS.md — Empirical results
+
+This is a permanent, referenceable record of what we learned from the data.
+It is distinct from `CLAUDE.md`: `CLAUDE.md` holds *rules for how to build*;
+this file holds *what we found by looking*. Consult it before making
+modelling decisions — several of the entries below directly constrain what a
+later pass is allowed to assume.
+
+---
+
+## 1. Dataset characteristics
+
+- Source: UCI ML Repository dataset 791, MetroPT-3 (Air Production Unit /
+  compressor telemetry from a metro train).
+- File: `MetroPT3(AirCompressor).csv`
+- SHA256 (pinned, of the downloaded zip archive — see `data/download.py`'s
+  checksum convention): `aab991a970e58210de853bb8078ce0e63abb4d9412fdc5c79792dae3d8e1721a`
+- Span: 2020-02-01 → 2020-08-31, measured 213 days 03:59:50
+- Rows: 1,516,948
+- Columns: 15 usable — 7 analog + 8 digital (timestamp is the index)
+  - Analog: `TP2`, `TP3`, `H1`, `DV_pressure`, `Reservoirs`,
+    `Oil_temperature`, `Motor_current`
+  - Digital: `COMP`, `DV_eletric`, `Towers`, `MPG`, `LPS`,
+    `Pressure_switch`, `Oil_level`, `Caudal_impulses`
+- **Sampling: 10 seconds nominal**, with clock jitter. Interval counts:
+  10s → 1,337,521 | 9s → 128,277 | 12s → 38,321 | 13s → 7,988 | 11s → 4,471.
+  This is NOT 1 Hz data.
+- A `Unnamed: 0` column is present in the raw CSV — a pandas index
+  serialisation artifact, not a sensor. Dropped at load time with a warning.
+
+## 2. Ground truth — failure events
+
+The dataset is **unlabeled**; UCI provides a company failure-report table for
+evaluation. All four events are **Air leak / High stress**.
+
+| # | Start | End | Maintenance |
+|---|---|---|---|
+| 1 | 2020-04-18 00:00 | 2020-04-18 23:59 | not recorded |
+| 2 | 2020-05-29 23:30 | 2020-05-30 06:00 | 2020-05-30 12:00 ¹ |
+| 3 | 2020-06-05 10:00 | 2020-06-07 14:30 | 2020-06-08 16:00 |
+| 4 | 2020-07-15 14:30 | 2020-07-15 19:00 | 2020-07-16 00:00 |
+
+Documented deviations from source (label-construction decisions):
+- ¹ The source table prints "Maintenance on 30**Apr** at 12:00" for event 2,
+  which predates the failure by a month and contradicts every other row (repair
+  follows failure by hours). Treated as a typo for 30 May 12:00.
+- The source table numbers the events **#1, #1, #3, #4** — the second entry
+  should be #2. Ids here are sequential.
+- Event 1 has no maintenance entry, so its repair time is unknown; a
+  conservative fixed fallback margin is used instead.
+
+## 3. Data quality — gaps
+
+- **331 gaps exceeding 1 minute**, totalling **37 days 21:31:03** — roughly
+  **18% of the timeline is missing**.
+- Largest gaps (timestamp = end of gap): 2020-04-27 01:12:49 (2d 00:01:58) |
+  2020-06-28 23:07:43 (1d 12:14:36) | 2020-03-01 04:00:09 (1d 04:03:01) |
+  2020-08-05 08:23:01 (1d 00:40:33) | 2020-05-25 01:14:14 (1d 00:34:51).
+- **Gaps are not random.** The 21h28m gap ending 2020-06-08 11:48 spans
+  2020-06-07 14:19 → 2020-06-08 11:48, which is almost exactly event 3's
+  out-of-service repair period (failure ended 7 Jun 14:30, maintenance 8 Jun
+  16:00). Missing data carries information about machine state.
+- **CORRECTION to an earlier claim:** the largest gap (25–27 April) does NOT
+  coincide with any documented failure. Event 1 was a week earlier (18 April).
+  An earlier pass summary asserted otherwise; that assertion was wrong.
+- A 14h11m gap spanning 2020-07-14 07:16 → 21:28 sits **inside event 4's
+  pre-failure window**.
+
+### Pre-failure window coverage (at 72h width, measured)
+
+| event | coverage |
+|---|---|
+| 1 | 0.878 |
+| 2 | 0.886 |
+| 3 | 0.843 |
+| 4 | **0.704** |
+
+Event 4 is materially worse: four gaps (14h11m, 5h36m, 1h45m, 5min ≈ 21.6h
+total) fall inside its 72h window. If event 4 is the worst-detected event,
+this is the likely explanation — it is a data limitation, not necessarily a
+model failure. Note also that *score* coverage is slightly worse than *data*
+coverage, because each gap additionally invalidates roughly one window-duration
+of scoring positions on its trailing edge.
+
+## 4. Split design
+
+- Walk-forward (rolling-origin, expanding window), 4 folds, one per event.
+  Chosen because 4 events cannot support a single holdout — recall on one test
+  event is either 0% or 100%.
+- Embargo: 24h between train end and test start, to prevent sliding windows
+  straddling the boundary.
+- **The event 2 → event 3 gap is 6 days 4 hours**, which caps how wide the
+  pre-failure window sweep can go before event 3's window swallows event 2's
+  post-repair recovery period. Cap is currently **72h** (tightened from 96h
+  when the overlap check was extended to cover `test_start`, not just the label
+  window).
+- Fold 1's training slice: 529,973 rows over ~71 days — **86% of the 613,440
+  expected at complete 10s sampling**.
+
+## 5. Scaling findings
+
+- **Robust (median/IQR) is the default**, because training data still contains
+  *unreported* anomalies that only median/IQR resist.
+- Fold 1 (Feb–mid-Apr) vs full series (Feb–Aug), robust stats:
+  `Oil_temperature` center 58.275 → 62.700 (+7.6%), IQR 7.400 → 9.475 (+28%).
+  This is **seasonal drift**, and it is the concrete demonstration that fitting
+  a scaler on the full series would encode summer temperatures that had not yet
+  happened when fold 1 makes its April prediction.
+- Pathological spreads (global, fold 1): `TP2` IQR 0.004 (~250× amplification),
+  `DV_pressure` IQR 0.006, `Motor_current` center 0.042 with IQR 3.750 (spread
+  ~90× the center).
+- `TP3` (center 8.992, IQR 0.964) and `Reservoirs` (8.994, 0.962) are
+  near-duplicate — closely coupled parts of the same pneumatic circuit. This
+  may make per-channel attribution ambiguous when both light up.
+- `zero_scale_epsilon` (1e-8) guards **division by zero** on constant channels.
+  It deliberately does NOT catch TP2's 0.004 — that is real amplification, not
+  a numerical bug, and substituting 1.0 there would silently disable scaling.
+
+## 6. Windowing
+
+- 30-minute window = 180 samples at 10s; train stride 5min = 30 samples.
+- Fold 1: 17,179 windows kept, **481 dropped (2.7%) for spanning gaps**,
+  tensor 185.53 MB.
+- Each gap invalidates roughly `window_duration / stride` windows, so longer
+  windows discard more data around each gap — an argument for shorter windows
+  given 331 gaps.
+
+## 7. Operating regimes
+
+### Flag polarity — verified empirically, not assumed
+
+| flag | meaning | evidence (mean Motor_current) |
+|---|---|---|
+| `COMP` | 1 → OFF, 0 → ON | COMP=0 → 5.60; COMP=1 → 1.36 |
+| `DV_eletric` | 1 → ON, 0 → OFF | mirror image of COMP |
+| `MPG` | 1 → OFF, 0 → ON | MPG=1 → 1.34; MPG=0 → 5.56 |
+
+COMP's polarity is the **inverse of the naive reading** — it is active when
+there is *no* air intake. Pairwise agreement after normalising polarity:
+COMP↔DV_eletric 98.9%, COMP↔MPG 99.6%, DV_eletric↔MPG 99.3%. COMP is the
+deciding flag.
+
+### Occupancy (original two-state segmentation, superseded by §7a below)
+
+| state | occupancy | median run |
+|---|---|---|
+| OFF | 82.0% | 1080s (18 min) |
+| ON | 13.8% | 99s |
+| TRANSITION | 4.2% | 20s |
+
+**Architecturally critical:** ON's median run is 99s ≈ 10 samples, far shorter
+than the 180-sample window. **There is no such thing as an "ON window"** —
+essentially every window spans multiple full cycles. Therefore regime handling
+cannot be applied at window level; scaling must be applied **per-timestamp, by
+that timestamp's regime, before windowing**.
+
+### Within-regime variance (the key table)
+
+| channel | global IQR | within-OFF | within-ON |
+|---|---|---|---|
+| `Motor_current` | 3.7675 | 3.675 | 0.630 |
+| `TP2` | 0.0040 | 0.0040 | 2.3120 |
+| `DV_pressure` | 0.0040 | 0.0040 | 0.8040 |
+
+Interpretation:
+- `Motor_current`: **fixed within ON** (3.77 → 0.63). Within-OFF barely moves
+  because OFF is itself bimodal (below).
+- `TP2` / `DV_pressure`: these are **LOADED-only channels**. They vent to ~0
+  when the compressor stops, so their 0.004 OFF spread is sensor noise around
+  zero carrying no information; during ON they have healthy spread (2.31 /
+  0.80). Regime conditioning does not "fix" them — it reveals they are only
+  alive in one state.
+
+### OFF is bimodal — a third state
+
+Of 1,269,620 OFF samples: **822,119 (64.8%) at Motor_current ≈ 0** and
+**447,307 (35.2%) at ~3.5–4.3A sustained** (median run ~400s, so not a
+transient).
+
+**No digital flag separates them.** Separation scores
+(|P(flag=1|low) − P(flag=1|high)|): Oil_level 0.042, Caudal_impulses 0.037,
+DV_eletric 0.015, MPG 0.015, Pressure_switch 0.003, LPS 0.000, **Towers
+0.000**. The flags are saturated during OFF. The tower-regeneration hypothesis
+was tested and rejected.
+
+Analog evidence that the two modes are physically distinct:
+
+| channel | STOPPED median | OFFLOAD median | shift |
+|---|---|---|---|
+| `TP3` | 8.658 | 9.644 | 0.986 |
+| `H1` | 8.646 | 9.630 | 0.984 |
+| `Reservoirs` | 8.660 | 9.644 | 0.984 |
+| `Oil_temperature` | 59.375 | 67.650 | 8.275 |
+| `Motor_current` | 0.040 | 3.765 | 3.725 |
+| `TP2` | -0.012 | -0.012 | **0.000** |
+| `DV_pressure` | -0.020 | -0.020 | **0.000** |
+
+Only **0.015% of OFF samples** fall in the 1–3A valley between the modes — the
+separation is near-total, so a 2A threshold sits in genuine emptiness.
+
+### The duty cycle
+
+Putting it together: **LOADED** compresses the system up → **OFFLOAD** sits at
+the top of the cycle (~9.64 bar, motor spinning, intake closed) → **STOPPED**
+is the *decay phase*, pressure bleeding down from ~9.6 toward the 8.2 bar
+threshold at which MPG restarts the compressor.
+
+Consequence: STOPPED is **not a static state**. Its pressure IQR of 0.63
+reflects the systematic sweep from 9.6 → 8.2, not variability around a stable
+normal. A static per-state center is therefore the wrong model for STOPPED;
+time-since-entering-STOPPED, or decay *rate* rather than level, may be needed.
+
+### 7a. Third state implemented (pass 10)
+
+The bimodal split above is now a real, config-driven fourth regime label.
+Segmentation is four states: `LOADED` (COMP=0), `OFFLOAD` (COMP=1 and
+Motor_current ≥ `regimes.offload_current_threshold`, default 2.0A), `STOPPED`
+(COMP=1 and Motor_current below that threshold), and `TRANSITION` (within
+`transition_settle` of any committed state change).
+
+Measured four-state occupancy and run lengths (real dataset):
+
+| state | occupancy | n_runs | median run | q25 | q75 |
+|---|---|---|---|---|---|
+| STOPPED | 52.48% | 10,293 | 674s | 416s | 981s |
+| OFFLOAD | 27.46% | 10,694 | 376s | 367s | 377s |
+| LOADED | 13.80% | 10,624 | 99s | 89s | 109s |
+| TRANSITION | 6.25% | 31,611 | 20s | 20s | 20s |
+
+LOADED's occupancy/run-length is unchanged from the two-state segmentation
+above (it was never part of the OFF/COMP=1 split). TRANSITION occupancy rose
+from 4.2% to 6.25% because the cycle now has up to three committed
+transitions per cycle (LOADED→OFFLOAD→STOPPED→LOADED) instead of two.
+OFFLOAD's run length is remarkably tight (q25=367s, q75=377s — a 10-second
+spread) compared to STOPPED's wide spread (416–981s), consistent with §7's
+"duty cycle" interpretation: OFFLOAD is a comparatively fixed-duration phase
+at the top of the cycle, while STOPPED is a variable-length pressure-decay
+phase, not a steady state.
+
+## 8. Cycle timing — the strongest leak signal found
+
+An air leak makes pressure decay faster → shorter STOPPED periods → more
+frequent cycling. Median STOPPED duration (20-cycle rolling) was plotted
+against the four events:
+
+- **Event 2: clear precursor.** Duration collapses from ~1200s to ~280s around
+  15–20 May and stays there until the 29 May failure — roughly **10 days of
+  sustained warning**.
+- **Event 4: sharp dip** to ~150s (the lowest point in the series) at the
+  failure.
+- **Events 1 and 3: no clear precursor.** Duration is ordinary (~1000–1400s)
+  before event 1, and *elevated* going into event 3 (post-event-2 recovery).
+
+So this single hand-built feature gives **2 of 4 events**, not 4 of 4.
+
+### Unreported anomaly, empirically confirmed
+
+Early March shows a ~1 week dip to ~200–250s — **as extreme as event 2's
+precursor** — with no reported failure. The report table lists only high-stress
+air leaks, so this may be an unreported event or a genuine near-miss. It is
+**unresolvable from the available labels**, and any detector using this feature
+will fire there. State this plainly rather than reclassifying it.
+
+### Drift — breaks static thresholds
+
+Median STOPPED duration trends from **~1400s (Feb) to ~500s (Aug)** — a **3×
+shift, larger than most event-related dips**.
+
+Consequences:
+- Fold 4 trains back to February (normal ≈ 1400s) and tests in July (normal ≈
+  500s). A static notion of normal cycle timing would alarm continuously
+  through summer.
+- Thresholds on this feature must be **relative to a trailing baseline**, not
+  absolute.
+- But a baseline that adapts too fast absorbs gradual degradation and loses the
+  signal (boiling-frog). Event 2's step change would survive a ~7-day baseline;
+  slow drift would not. The baseline window is a deliberate choice.
+- **Confound:** `Oil_temperature` rose 58 → 63°C over the same period. Seasonal
+  ambient change and cycle frequency move together — do not attribute the trend
+  to wear without argument.
+
+### Consequence for the window-width cap
+
+Event 2's precursor is visible ~10 days out, but the sweep is capped at 72h by
+the E2/E3 proximity. Events 1, 2 and 4 have no such constraint. Options:
+per-event window widths, or **keep wide windows and mask the overlapping
+region from false-alarm counting** (the evaluation harness already supports
+masking). The latter is cleaner.
+
+## 9. Open questions / unresolved
+
+- **Is the STOPPED-duration drift partly artifact?** Run detection splits
+  STOPPED runs on data gaps (>1min), and there are 331 such gaps. A gap inside
+  a STOPPED period truncates it, making duration look shorter. If gap density
+  increased over the recording period, some downward trend is artifact.
+
+  **Checked in pass 10 — verdict: PHYSICAL, not artifact.**
+  `analysis.monthly_gap_and_stopped_summary` on the real dataset:
+
+  | month | n_gaps | total_gap_seconds | n_stopped_runs | median_stopped_seconds |
+  |---|---|---|---|---|
+  | 2020-02 | 36 | 390,648 | 1,188 | 1269 |
+  | 2020-03 | 42 | 379,706 | 1,468 | 813 |
+  | 2020-04 | 55 | 644,464 | 1,059 | 1021 |
+  | 2020-05 | 52 | 499,183 | 1,407 | 565 |
+  | 2020-06 | 37 | 394,735 | 1,524 | 555 |
+  | 2020-07 | 64 | 462,660 | 1,880 | 555 |
+  | 2020-08 | 44 | 495,963 | 1,925 | 595 |
+
+  Gap density (both count and total missing seconds) is **noisy, not
+  trending** — April has the single highest gap total (644,464s) of any
+  month, yet a *higher* median STOPPED duration (1021s) than March (813s)
+  and much higher than May–August (~555–595s). Correlation across the
+  7 months: `corr(total_gap_seconds, median_stopped) = 0.047` (essentially
+  zero), `corr(n_gaps, median_stopped) = -0.33` (weak, and in the artifact
+  direction, but not remotely large enough to explain a ~2.3× decline from
+  noise alone with n=7).
+
+  Directly quantifying the gap-splitting mechanism's own effect: re-running
+  the same run detection WITHOUT splitting on gaps (pure value-change runs,
+  bridging over every gap) gives medians within **1–8% of the
+  gap-splitting version, in every month** (e.g. Feb 1308s vs. 1269s, Aug
+  605s vs. 595s) — an order of magnitude smaller than the observed ~2.3×
+  decline, and the size of this small effect does not grow toward August
+  (it is largest in May, at 8%). The mechanism being questioned is real but
+  tiny, and does not track the drift.
+
+  **Conclusion: the STOPPED-duration decline is physical**, not a
+  by-product of increasing gap density biasing run detection.
+
+- **Circularity in the third state:** Motor_current defines the STOPPED /
+  OFFLOAD boundary but is also a scored channel. Mitigated by the 0.015% valley
+  (a fault would need a ~2A electrical shift to move the assignment) and
+  optionally by excluding Motor_current from scored channels during OFF.
+  Documented, not eliminated. `regimes.exclude_motor_current_when_off`
+  (default `false`) now records this intent in config, but it is deliberately
+  NOT wired into scoring in this pass — scoring does not exist yet.
+- Whether the 72h cap should be replaced by masking.
+- How to normalise the pressure channels within STOPPED given it is a decay
+  phase, not a steady state.
+
+## 10. Process lessons
+
+- Notebook CWD ≠ repo root; resolve data paths from the package location, not
+  the working directory.
+- After schema changes, restart the Jupyter kernel — `autoreload` does not
+  reliably pick up changed class definitions.
+- `extra="forbid"` on config models catches typo'd keys that would otherwise be
+  silently ignored.
+- Declare dependencies explicitly; matplotlib was present only transitively via
+  mlflow, which is fragile.
+- A guard test must be shown to **fail on bad input**, not merely pass on good
+  input.
+- Verify reported claims independently — one pass summary asserted a gap
+  coincided with a failure; it did not (see §3). The zip-archive SHA256 in §1
+  was independently re-verified against the file on disk before being recorded
+  here, following the same principle.
