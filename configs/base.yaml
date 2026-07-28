@@ -110,6 +110,26 @@ evaluation:
   # sensor outage unrelated to a documented failure) -- none identified yet.
   additional_masked_regions: []
 
+  # Pass 13: null comparison + honest false-alarm estimation -- see
+  # docs/FINDINGS.md §13. A detection's false-alarm rate alone cannot show
+  # skill (evaluated_days is too short to trust a rate from 1-2 episodes,
+  # and widening the window silently reclassifies episodes without the
+  # model changing) -- every reported detection must also show what chance
+  # alone would give.
+  #
+  # Candidate placements evaluated by the empirical permutation null
+  # (evaluation/metrics.py p_chance_permutation) -- a deterministic,
+  # evenly-spaced grid across the fold's test period.
+  permutation_samples: 500
+  # A detection is flagged "not distinguishable from chance" when EITHER
+  # null estimate (Poisson or permutation) exceeds this. Starting point,
+  # not a validated significance level -- set null before seeing results,
+  # same discipline as false_alarm_ceiling.
+  chance_threshold: 0.10
+  # Symmetric padding (hours) around every excluded region before taking
+  # the complement to build pooled_normal_stretches (evaluation/events.py).
+  pooled_buffer_hours: 24.0
+
 scaling:
   # robust (median / IQR) is the DEFAULT: training data still contains
   # UNREPORTED anomalies -- only the four documented events above can be

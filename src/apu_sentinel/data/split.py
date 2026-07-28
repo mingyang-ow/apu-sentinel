@@ -49,6 +49,40 @@ could open before event 2's training-exclusion region ended even though
 the plain window-width check passed, since it doesn't account for the
 extra embargo subtracted when deriving test_start. make_folds() raises on
 this too, naming the offending event pair and the overlap duration.
+
+Pass 13, Part C: the constraint above binds event 3 alone (its prior
+exclusion ends only ~94h before its onset), but before this pass it was
+applied GLOBALLY -- every event capped at whatever the tightest event
+tolerates, via a single shared max(window_widths). make_folds() now takes
+an optional per-event width_hours_by_event mapping (see
+event_max_width_hours()) so each event can be evaluated at its OWN maximum
+feasible width instead, as a SEPARATE sensitivity fold set -- the common,
+shared-max sweep (the default, unchanged) remains the cross-model-
+comparable result.
+
+Public API:
+- `Fold` -- one fold's boundaries: train_start/train_end, test_start/
+  test_end, train_exclusions (tuple of (start, end) regions to drop from
+  training). Produced by make_folds(); consumed by apply_fold() and every
+  evaluation/ function that needs test_start/test_end.
+- `make_folds(settings, data_start, data_end, width_hours_by_event=None)
+  -> list[Fold]` -- one Fold per documented failure event. Raises
+  ValueError on empty window_widths, insufficient lead-in data, or any
+  width (shared or per-event) that would overlap an earlier event's
+  exclusion region.
+- `apply_fold(df, fold, strategy="time") -> (train_df, test_df)` -- slices
+  df by time only; `strategy` must be "time" (a rejectable guard, not a
+  real option). Gotcha: does not scale, window, or otherwise transform --
+  callers still need fit_regime_scalers/transform_by_regime and/or
+  make_windows downstream.
+- `event_max_width_hours(settings, data_start) -> {event_id: hours}` --
+  each event's own maximum feasible pre-failure width; feed straight back
+  into make_folds()'s width_hours_by_event for the Part C sensitivity fold
+  set.
+- `extend_test_end_for_false_alarms(fold, event, events_sorted,
+  training_exclusion, data_end) -> Fold` -- a copy of `fold` with test_end
+  pushed out for false-alarm counting only; does not affect detection
+  (categorise_episode never reads test_end).
 """
 
 from __future__ import annotations
@@ -80,38 +114,45 @@ def _exclusion_window(event, training_exclusion) -> tuple[pd.Timestamp, pd.Times
     return start, end
 
 
-def _check_no_window_overlap(events_sorted, window_widths, training_exclusion) -> None:
-    """Raise if any configured window width, applied to any event, would
-    reach back far enough to overlap an earlier event's exclusion region.
+def _check_no_window_overlap(events_sorted, width_hours_by_event, training_exclusion) -> None:
+    """Raise if any event's OWN configured width (width_hours_by_event[event.id])
+    would reach back far enough to overlap an earlier event's exclusion
+    region. Checking each event against only the width actually used to
+    derive ITS OWN test_start is equivalent to checking every smaller
+    configured width too (a smaller width's label_start is always closer
+    to later_start, i.e. less far back), so this is not a weaker check
+    than iterating the whole sweep -- just parametrised per event instead
+    of assuming every event shares the same global width (pass 13, Part C).
     """
     for i, earlier in enumerate(events_sorted):
         _, excl_end = _exclusion_window(earlier, training_exclusion)
         for later in events_sorted[i + 1 :]:
             later_start = pd.Timestamp(later.start)
-            for width in window_widths:
-                label_start = later_start - pd.Timedelta(hours=width)
-                if label_start < excl_end:
-                    raise ValueError(
-                        f"window width {width}h applied to event {later.id} "
-                        f"(starts {later_start}) reaches back to {label_start}, "
-                        f"which overlaps event {earlier.id}'s training-exclusion "
-                        f"region (ends {excl_end}). Reduce evaluation.window_widths "
-                        "or the split.training_exclusion margins."
-                    )
+            width = width_hours_by_event[later.id]
+            label_start = later_start - pd.Timedelta(hours=width)
+            if label_start < excl_end:
+                raise ValueError(
+                    f"window width {width}h applied to event {later.id} "
+                    f"(starts {later_start}) reaches back to {label_start}, "
+                    f"which overlaps event {earlier.id}'s training-exclusion "
+                    f"region (ends {excl_end}). Reduce evaluation.window_widths "
+                    "or the split.training_exclusion margins."
+                )
 
 
 def _compute_test_start(
-    event_start: pd.Timestamp, max_width_hours: float, embargo: pd.Timedelta
+    event_start: pd.Timestamp, width_hours: float, embargo: pd.Timedelta
 ) -> pd.Timestamp:
-    return event_start - pd.Timedelta(hours=max_width_hours) - embargo
+    return event_start - pd.Timedelta(hours=width_hours) - embargo
 
 
 def _check_no_test_start_overlap(
-    events_sorted, max_width_hours, embargo, training_exclusion
+    events_sorted, width_hours_by_event, embargo, training_exclusion
 ) -> None:
     """Raise if any fold's actual test_start -- which backs off by BOTH
-    max(window_widths) and embargo_hours -- would open before an earlier
-    event's training-exclusion region has ended.
+    that event's OWN width (width_hours_by_event[event.id]) and
+    embargo_hours -- would open before an earlier event's training-exclusion
+    region has ended.
 
     Tighter than _check_no_window_overlap: that check only validates the
     label window itself, not the extra embargo subtracted when deriving
@@ -122,12 +163,13 @@ def _check_no_test_start_overlap(
         _, excl_end = _exclusion_window(earlier, training_exclusion)
         for later in events_sorted[i + 1 :]:
             later_start = pd.Timestamp(later.start)
-            test_start = _compute_test_start(later_start, max_width_hours, embargo)
+            width = width_hours_by_event[later.id]
+            test_start = _compute_test_start(later_start, width, embargo)
             if test_start < excl_end:
                 overlap = excl_end - test_start
                 raise ValueError(
                     f"fold for event {later.id}: test_start {test_start} (event "
-                    f"start {later_start} minus widest window {max_width_hours}h "
+                    f"start {later_start} minus width {width}h "
                     f"and embargo {embargo}) begins {overlap} before event "
                     f"{earlier.id}'s training-exclusion region ends ({excl_end}). "
                     "Reduce evaluation.window_widths, split.embargo_hours, or the "
@@ -135,7 +177,67 @@ def _check_no_test_start_overlap(
                 )
 
 
-def make_folds(settings, data_start: pd.Timestamp, data_end: pd.Timestamp) -> list[Fold]:
+# A width computed to land test_start EXACTLY on the make_folds()
+# lead-in-data boundary would make train_end land EXACTLY on data_start --
+# and make_folds() requires train_end strictly AFTER data_start (an
+# unrelated check, about having any training data at all), not merely
+# at-or-after. event_max_width_hours() shaves this sliver off so its
+# output is always directly, strictly feasible when fed back in.
+_LEAD_IN_EPSILON = pd.Timedelta(seconds=1)
+
+
+def event_max_width_hours(settings, data_start: pd.Timestamp) -> dict[int, float]:
+    """Each documented event's OWN maximum feasible pre-failure window
+    width (hours), replacing the single GLOBAL cap CLAUDE.md's "pre-failure
+    window width" section documents as binding on event 3's tight ~94h
+    geometry alone but applied, before pass 13, to every event uniformly.
+
+    Two independent constraints bound each event's width, and the smaller
+    one wins:
+
+    1. test_start = event.start - width - embargo must not precede any
+       EARLIER event's own training-exclusion region end (the same check
+       _check_no_test_start_overlap enforces) -- one candidate per earlier
+       event.
+    2. train_end (= test_start - embargo) must fall strictly after
+       data_start regardless of whether an earlier event exists at all
+       (make_folds()'s own, unrelated lead-in-data check) -- always a
+       candidate, and the ONLY one for the earliest event.
+
+    Passing this mapping to make_folds() (as width_hours_by_event) builds a
+    fold set where each event uses its own maximum instead of a shared one
+    -- a SEPARATE, sensitivity-only fold set (CLAUDE.md's "pre-failure
+    window width": window_widths is a swept, reported result, never
+    silently replaced by a single "best" number).
+    """
+    events_sorted = sorted(settings.evaluation.failure_events, key=lambda e: pd.Timestamp(e.start))
+    training_exclusion = settings.split.training_exclusion
+    embargo = pd.Timedelta(hours=settings.split.embargo_hours)
+    data_start = pd.Timestamp(data_start)
+
+    result = {}
+    for event in events_sorted:
+        event_start = pd.Timestamp(event.start)
+        candidates_hours = []
+
+        for other in events_sorted:
+            if pd.Timestamp(other.start) < event_start:
+                _, excl_end = _exclusion_window(other, training_exclusion)
+                candidates_hours.append((event_start - embargo - excl_end).total_seconds() / 3600.0)
+
+        lead_in_limit = event_start - 2 * embargo - data_start - _LEAD_IN_EPSILON
+        candidates_hours.append(lead_in_limit.total_seconds() / 3600.0)
+
+        result[event.id] = max(0.0, min(candidates_hours))
+    return result
+
+
+def make_folds(
+    settings,
+    data_start: pd.Timestamp,
+    data_end: pd.Timestamp,
+    width_hours_by_event: dict[int, float] | None = None,
+) -> list[Fold]:
     """Build one walk-forward fold per documented failure event.
 
     `settings` must expose `settings.split` (embargo_hours,
@@ -144,10 +246,19 @@ def make_folds(settings, data_start: pd.Timestamp, data_end: pd.Timestamp) -> li
     fold time boundaries only, not materialised DataFrames -- see
     apply_fold() for slicing an actual df.
 
+    width_hours_by_event: optional {event_id: width_hours} override of the
+    width used to derive THAT event's own test_start. Defaults to None,
+    meaning every event uses max(evaluation.window_widths) -- the ORIGINAL
+    global-cap behaviour (unchanged), needed for the common, cross-model-
+    comparable sweep. Pass event_max_width_hours(settings, data_start)'s
+    output to build a SEPARATE fold set at each event's own maximum feasible
+    width instead (pass 13, Part C's per-event caps) -- a sensitivity
+    result, never a silent replacement of the common sweep.
+
     Raises:
         ValueError: if evaluation.window_widths is empty, if a fold's
             computed train_end would leave no lead-in data before
-            data_start, or if any configured window width -- or the fold's
+            data_start, or if any event's own width -- or the fold's
             actual test_start -- would overlap an earlier event's
             training-exclusion region (see _check_no_window_overlap and
             _check_no_test_start_overlap).
@@ -158,11 +269,14 @@ def make_folds(settings, data_start: pd.Timestamp, data_end: pd.Timestamp) -> li
 
     events_sorted = sorted(settings.evaluation.failure_events, key=lambda e: pd.Timestamp(e.start))
     training_exclusion = settings.split.training_exclusion
-    _check_no_window_overlap(events_sorted, window_widths, training_exclusion)
-
-    max_width = max(window_widths)
     embargo = pd.Timedelta(hours=settings.split.embargo_hours)
-    _check_no_test_start_overlap(events_sorted, max_width, embargo, training_exclusion)
+
+    if width_hours_by_event is None:
+        shared_max = max(window_widths)
+        width_hours_by_event = {event.id: shared_max for event in events_sorted}
+
+    _check_no_window_overlap(events_sorted, width_hours_by_event, training_exclusion)
+    _check_no_test_start_overlap(events_sorted, width_hours_by_event, embargo, training_exclusion)
 
     data_start = pd.Timestamp(data_start)
     data_end = pd.Timestamp(data_end)
@@ -181,7 +295,8 @@ def make_folds(settings, data_start: pd.Timestamp, data_end: pd.Timestamp) -> li
                 "-- not enough data to cover this fold's test period"
             )
 
-        test_start = _compute_test_start(event_start, max_width, embargo)
+        width = width_hours_by_event[event.id]
+        test_start = _compute_test_start(event_start, width, embargo)
         train_end = test_start - embargo
         if train_end <= data_start:
             raise ValueError(
@@ -209,6 +324,54 @@ def make_folds(settings, data_start: pd.Timestamp, data_end: pd.Timestamp) -> li
             )
         )
     return folds
+
+
+def extend_test_end_for_false_alarms(
+    fold: Fold,
+    event,
+    events_sorted,
+    training_exclusion,
+    data_end: pd.Timestamp,
+) -> Fold:
+    """Returns a NEW Fold (fold.test_end pushed forward) giving false-alarm
+    counting far more normal-operation time than the tight test period used
+    for detection (pass 13, Part B1) -- CLAUDE.md rule 5's evaluated_days
+    denominator cannot support a rate estimate from 1-2 episodes over a
+    ~3-day window.
+
+    test_end extends to just BEFORE the next chronologically later event's
+    training-exclusion region begins (never INTO it -- that period is that
+    other event's own ramp-up/settle time, not this fold's normal
+    background), or to data_end for the final fold.
+
+    Detection and lead time are UNCHANGED by this: categorise_episode and
+    pre_failure_window are keyed off event.start and window_width_hours
+    alone, never fold.test_end. Only evaluated_days/false_alarms_per_day
+    change, because more test-period time (and any episodes within it) is
+    now visible to the harness.
+
+    The extended period legitimately OVERLAPS later folds' own TRAINING
+    periods -- normal in walk-forward (folds overlap by construction, each
+    fold remains internally causal on its own) and not leakage; it is not,
+    however, allowed to overlap another event's own EXCLUSION region (see
+    above), which is the one thing that would make settle-time look like
+    normal background.
+    """
+    later_events = [e for e in events_sorted if pd.Timestamp(e.start) > pd.Timestamp(event.start)]
+    if later_events:
+        next_event = min(later_events, key=lambda e: pd.Timestamp(e.start))
+        new_test_end, _ = _exclusion_window(next_event, training_exclusion)
+    else:
+        new_test_end = pd.Timestamp(data_end)
+
+    return Fold(
+        event_id=fold.event_id,
+        train_start=fold.train_start,
+        train_end=fold.train_end,
+        test_start=fold.test_start,
+        test_end=new_test_end,
+        train_exclusions=fold.train_exclusions,
+    )
 
 
 def apply_fold(

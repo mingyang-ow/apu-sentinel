@@ -138,6 +138,26 @@ class EvaluationConfig(BaseModel):
     # known sensor outage unrelated to a documented failure).
     additional_masked_regions: list[MaskedRegionConfig] = Field(default_factory=list)
 
+    # --- pass 13: null comparison + honest false-alarm estimation --------
+
+    # Number of candidate placement times evaluated by the empirical
+    # permutation null (evaluation/metrics.py p_chance_permutation) -- a
+    # deterministic, evenly-spaced grid across the test period, not a
+    # random sample (see that function's docstring for why).
+    permutation_samples: int = 500
+    # A detection is flagged "not distinguishable from chance" when EITHER
+    # null estimate (Poisson or permutation) exceeds this. 0.10 is a
+    # starting point, not a validated significance level -- tune only
+    # after seeing baseline chance-comparison behaviour, same spirit as
+    # false_alarm_ceiling.
+    chance_threshold: float = 0.10
+    # Symmetric padding (hours) applied around every excluded region
+    # (pre-failure window + failure/settle period) before taking the
+    # complement to build pooled_normal_stretches (evaluation/events.py) --
+    # keeps a stretch from starting/ending right at the edge of a real
+    # precursor or repair period.
+    pooled_buffer_hours: float = 24.0
+
 
 class TrainConfig(BaseModel):
     model_config = _STRICT
