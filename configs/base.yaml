@@ -129,6 +129,33 @@ scaling:
   # substituted instead of dividing by ~0. data/scaling.py logs a WARNING
   # naming the channel and its computed scale when this fires.
   zero_scale_epsilon: 1e-8
+  # Regime-conditional scaling (data/scaling.py fit_regime_scalers /
+  # transform_by_regime) -- one scaler per (fold, regime), since global
+  # per-fold stats are dominated by mode-switching (docs/FINDINGS.md §7).
+  # A (fold, regime) pair below this sample count raises, naming both --
+  # 100 is comfortably below any real fold/regime cell (fold 1 alone has
+  # tens of thousands of samples per regime) but catches a genuinely
+  # starved cell rather than fitting a near-meaningless scaler.
+  min_samples_per_regime: 100
+  # Which analog channels carry information in each regime -- every regime
+  # assign_regimes() can produce MUST have an entry. TP2/DV_pressure vent
+  # to ~0 when the compressor stops (median shift STOPPED-vs-OFFLOAD is
+  # exactly 0.000, docs/FINDINGS.md §7) -- their spread there is sensor
+  # noise, not signal, so scaling them would raise ~250x amplification to
+  # ~500x for zero benefit. Inactive in STOPPED/OFFLOAD, active in LOADED.
+  # TRANSITION is a genuine mixture state (docs/FINDINGS.md §7a) with no
+  # evidence yet to exclude anything -- conservatively, all channels active.
+  active_channels:
+    LOADED:
+      [TP2, TP3, DV_pressure, Reservoirs, Oil_temperature, Motor_current]
+    OFFLOAD: [TP3, H1, Reservoirs, Oil_temperature, Motor_current]
+    STOPPED: [TP3, H1, Reservoirs, Oil_temperature]
+    TRANSITION:
+      [TP3, Reservoirs, Oil_temperature]
+  # Warn-only (never substitutes/clamps) -- log if an ACTIVE channel's
+  # within-regime scale implies amplification above this factor, surfacing
+  # future instances of the TP2-style pathology instead of hiding them.
+  amplification_warn_factor: 100.0
 
 windowing:
   # Defaults chosen from the REAL dataset's measured sampling (see
@@ -217,5 +244,26 @@ regimes:
   # them (docs/FINDINGS.md §9). OFF by default -- a knowing choice, and NOT
   # wired into scoring in this pass (scoring does not exist yet).
   exclude_motor_current_when_off: false
+
+features:
+  # Pressure channel the decay-rate family reads. TP3 is a near-duplicate
+  # (docs/FINDINGS.md §5, closely coupled parts of the same pneumatic
+  # circuit) and would work equally well -- never hardcoded downstream.
+  decay_source_channel: Reservoirs
+  # decay_rate_running is NaN until this many samples have accumulated --
+  # a slope from 1-2 points is noise, not a rate.
+  decay_min_samples: 3
+  # Matches the "gaps > 1 min" convention established for regime-run
+  # analysis (docs/FINDINGS.md §9 / analysis.monthly_gap_and_stopped_summary).
+  gap_threshold: 1min
+  # Trailing window for baseline-relative (value / trailing_median)
+  # variants. 7 days: short enough that event 2's ~3x step change (10 days
+  # of sustained warning, docs/FINDINGS.md §8) still stands out against it,
+  # long enough that gradual seasonal drift isn't itself absorbed into
+  # "normal" (the boiling-frog failure mode of an over-adaptive baseline).
+  baseline_window: 7D
+  # Trailing window for duty_ratio_trailing -- a current-state indicator,
+  # not a drift baseline, so deliberately much shorter than baseline_window.
+  duty_ratio_window: 1h
 
 model: {}

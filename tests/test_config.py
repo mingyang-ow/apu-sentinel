@@ -66,6 +66,13 @@ BASE_YAML = {
         "transition_settle": "60s",
         "exclude_motor_current_when_off": False,
     },
+    "features": {
+        "decay_source_channel": "Reservoirs",
+        "decay_min_samples": 3,
+        "gap_threshold": "1min",
+        "baseline_window": "7D",
+        "duty_ratio_window": "1h",
+    },
     "train": {"epochs": 1, "max_minutes": 1},
     "model": {},
 }

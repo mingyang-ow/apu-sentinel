@@ -15,6 +15,7 @@ import pytest
 from apu_sentinel.config import (
     EvaluationConfig,
     FailureEvent,
+    FeaturesConfig,
     RegimesConfig,
     ResampleConfig,
     ScalingConfig,
@@ -548,3 +549,89 @@ def regimes_settings(regimes_scaling_config, regimes_config):
     .regimes.
     """
     return SimpleNamespace(scaling=regimes_scaling_config, regimes=regimes_config)
+
+
+# --- Fixtures for regime-conditional scaling tests (test_scaler_train_only) -
+#
+# Two regimes (LOADED, STOPPED), three analog channels with deliberately
+# distinct roles:
+#   chan_normal                  -- active everywhere, healthy spread, and a
+#                                    clearly different distribution per regime
+#                                    (proves per-regime fitting).
+#   chan_inactive_when_stopped   -- configured INACTIVE in STOPPED; has a
+#                                    tiny (pathological) spread there that
+#                                    must never surface, since it's zeroed.
+#   chan_pathological_but_active -- configured ACTIVE in both regimes, but
+#                                    has the SAME tiny spread in STOPPED --
+#                                    must trigger the amplification warning
+#                                    instead of being silently zeroed.
+
+
+@pytest.fixture
+def regime_scaling_settings():
+    scaling = ScalingConfig(
+        method="robust",
+        analog_columns=[
+            "chan_normal",
+            "chan_inactive_when_stopped",
+            "chan_pathological_but_active",
+        ],
+        passthrough_columns=["flag_digital"],
+        min_samples_per_regime=10,
+        active_channels={
+            "LOADED": [
+                "chan_normal",
+                "chan_inactive_when_stopped",
+                "chan_pathological_but_active",
+            ],
+            "STOPPED": ["chan_normal", "chan_pathological_but_active"],
+        },
+        amplification_warn_factor=50.0,
+    )
+    return SimpleNamespace(scaling=scaling)
+
+
+@pytest.fixture
+def regime_scaling_train_df_and_regimes() -> tuple[pd.DataFrame, pd.Series]:
+    rng = np.random.default_rng(0)
+    n = 100
+    index = pd.date_range("2020-01-01", periods=2 * n, freq="1h")
+
+    chan_normal = np.concatenate(
+        [rng.normal(loc=50, scale=5, size=n), rng.normal(loc=10, scale=2, size=n)]
+    )
+    chan_inactive_when_stopped = np.concatenate(
+        [rng.normal(loc=20, scale=3, size=n), rng.normal(loc=0, scale=0.0005, size=n)]
+    )
+    chan_pathological_but_active = np.concatenate(
+        [rng.normal(loc=30, scale=4, size=n), rng.normal(loc=0, scale=0.0005, size=n)]
+    )
+    flag_digital = rng.integers(0, 2, size=2 * n).astype(float)
+
+    df = pd.DataFrame(
+        {
+            "chan_normal": chan_normal,
+            "chan_inactive_when_stopped": chan_inactive_when_stopped,
+            "chan_pathological_but_active": chan_pathological_but_active,
+            "flag_digital": flag_digital,
+        },
+        index=index,
+    )
+    regimes = pd.Series(["LOADED"] * n + ["STOPPED"] * n, index=index, dtype="category")
+    return df, regimes
+
+
+# --- Fixtures for tests/test_cycles.py ----------------------------------
+
+
+@pytest.fixture
+def cycles_settings():
+    """Duck-typed like apu_sentinel.config.Settings: exposes .features."""
+    features = FeaturesConfig(
+        decay_source_channel="Reservoirs",
+        decay_min_samples=3,
+        gap_threshold="1min",
+        baseline_window="7D",
+        duty_ratio_window="1h",
+    )
+    return SimpleNamespace(features=features)

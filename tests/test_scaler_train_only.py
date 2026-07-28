@@ -16,7 +16,13 @@ import pandas as pd
 import pytest
 
 from apu_sentinel.data import scaling as scaling_module
-from apu_sentinel.data.scaling import FoldScaler, fit_scaler, transform
+from apu_sentinel.data.scaling import (
+    FoldScaler,
+    fit_regime_scalers,
+    fit_scaler,
+    transform,
+    transform_by_regime,
+)
 from apu_sentinel.data.split import apply_fold, make_folds
 
 
@@ -187,4 +193,139 @@ def test_constant_channel_gets_epsilon_guarded_scale_and_logs_warning(
     assert any(
         "channel_0" in record.message and "computed scale" in record.message
         for record in caplog.records
+    )
+
+
+def _expected_robust(values: np.ndarray) -> tuple[float, float]:
+    q75, q25 = np.percentile(values, [75, 25])
+    return float(np.median(values)), float(q75 - q25)
+
+
+def test_regime_scalers_fitted_per_regime_match_and_differ(
+    regime_scaling_settings, regime_scaling_train_df_and_regimes
+):
+    train_df, train_regimes = regime_scaling_train_df_and_regimes
+    scalers = fit_regime_scalers(train_df, train_regimes, regime_scaling_settings, fold_id=1)
+
+    assert set(scalers) == {"LOADED", "STOPPED"}
+    for regime in ("LOADED", "STOPPED"):
+        subset = train_df.loc[(train_regimes == regime).to_numpy()]
+        expected_center, expected_scale = _expected_robust(subset["chan_normal"].to_numpy())
+        assert scalers[regime].center_["chan_normal"] == pytest.approx(expected_center)
+        assert scalers[regime].scale_["chan_normal"] == pytest.approx(expected_scale)
+
+    assert scalers["LOADED"].center_["chan_normal"] != pytest.approx(
+        scalers["STOPPED"].center_["chan_normal"]
+    )
+
+
+def test_regime_scalers_still_train_only(
+    regime_scaling_settings, regime_scaling_train_df_and_regimes
+):
+    train_df, train_regimes = regime_scaling_train_df_and_regimes
+    train_scalers = fit_regime_scalers(train_df, train_regimes, regime_scaling_settings)
+
+    # An extreme, clearly-distinguishable "test period" appended after
+    # train -- must not move the train-only fitted parameters.
+    extra_index = pd.date_range(train_df.index[-1] + pd.Timedelta(hours=1), periods=50, freq="1h")
+    extra_df = pd.DataFrame(
+        {
+            "chan_normal": np.full(50, 5000.0),
+            "chan_inactive_when_stopped": np.full(50, 20.0),
+            "chan_pathological_but_active": np.full(50, 30.0),
+            "flag_digital": np.zeros(50),
+        },
+        index=extra_index,
+    )
+    extra_regimes = pd.Series(["LOADED"] * 50, index=extra_index, dtype="category")
+
+    combined_df = pd.concat([train_df, extra_df])
+    combined_regimes = pd.concat([train_regimes.astype(str), extra_regimes.astype(str)])
+    combined_scalers = fit_regime_scalers(combined_df, combined_regimes, regime_scaling_settings)
+
+    assert train_scalers["LOADED"].center_["chan_normal"] != pytest.approx(
+        combined_scalers["LOADED"].center_["chan_normal"]
+    )
+
+
+def test_inactive_channel_becomes_constant_zero(
+    regime_scaling_settings, regime_scaling_train_df_and_regimes
+):
+    train_df, train_regimes = regime_scaling_train_df_and_regimes
+    scalers = fit_regime_scalers(train_df, train_regimes, regime_scaling_settings)
+    transformed = transform_by_regime(train_df, train_regimes, scalers, regime_scaling_settings)
+
+    stopped_mask = (train_regimes == "STOPPED").to_numpy()
+    loaded_mask = (train_regimes == "LOADED").to_numpy()
+
+    # Inactive in STOPPED -- constant 0.0, NOT divided by its tiny scale.
+    assert (transformed.loc[stopped_mask, "chan_inactive_when_stopped"] == 0.0).all()
+    # Active in LOADED -- must NOT be constant zero there.
+    assert not (transformed.loc[loaded_mask, "chan_inactive_when_stopped"] == 0.0).all()
+
+
+def test_transformed_shape_stable_across_regime_mix(
+    regime_scaling_settings, regime_scaling_train_df_and_regimes
+):
+    train_df, train_regimes = regime_scaling_train_df_and_regimes
+    scalers = fit_regime_scalers(train_df, train_regimes, regime_scaling_settings)
+
+    loaded_mask = (train_regimes == "LOADED").to_numpy()
+    stopped_mask = (train_regimes == "STOPPED").to_numpy()
+
+    transformed_loaded = transform_by_regime(
+        train_df.loc[loaded_mask], train_regimes.loc[loaded_mask], scalers, regime_scaling_settings
+    )
+    transformed_stopped = transform_by_regime(
+        train_df.loc[stopped_mask],
+        train_regimes.loc[stopped_mask],
+        scalers,
+        regime_scaling_settings,
+    )
+    transformed_full = transform_by_regime(
+        train_df, train_regimes, scalers, regime_scaling_settings
+    )
+
+    assert list(transformed_loaded.columns) == list(transformed_full.columns)
+    assert list(transformed_stopped.columns) == list(transformed_full.columns)
+
+
+def test_min_samples_per_regime_guard_raises_naming_fold_and_regime(regime_scaling_settings):
+    index = pd.date_range("2020-01-01", periods=5, freq="1h")
+    df = pd.DataFrame(
+        {
+            "chan_normal": [1.0] * 5,
+            "chan_inactive_when_stopped": [1.0] * 5,
+            "chan_pathological_but_active": [1.0] * 5,
+            "flag_digital": [0.0] * 5,
+        },
+        index=index,
+    )
+    regimes = pd.Series(["STOPPED"] * 5, index=index, dtype="category")  # 5 < min_samples (10)
+
+    with pytest.raises(ValueError) as excinfo:
+        fit_regime_scalers(df, regimes, regime_scaling_settings, fold_id=7)
+
+    message = str(excinfo.value)
+    assert "fold 7" in message
+    assert "STOPPED" in message
+
+
+def test_amplification_warning_logged_not_substituted(
+    regime_scaling_settings, regime_scaling_train_df_and_regimes, caplog
+):
+    train_df, train_regimes = regime_scaling_train_df_and_regimes
+
+    with caplog.at_level("WARNING"):
+        scalers = fit_regime_scalers(train_df, train_regimes, regime_scaling_settings)
+
+    stopped_scale = scalers["STOPPED"].scale_["chan_pathological_but_active"]
+    assert stopped_scale != pytest.approx(1.0)  # NOT substituted
+    assert stopped_scale < 0.01  # genuinely tiny, as planted
+
+    assert any(
+        "chan_pathological_but_active" in r.message
+        and "STOPPED" in r.message
+        and "amplification" in r.message
+        for r in caplog.records
     )

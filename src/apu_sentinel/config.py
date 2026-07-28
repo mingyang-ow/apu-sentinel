@@ -161,6 +161,26 @@ class ScalingConfig(BaseModel):
     # channel) -- substituted with 1.0 rather than dividing by ~0. See
     # data/scaling.py fit_scaler().
     zero_scale_epsilon: float = 1e-8
+    # Regime-conditional scaling (data/scaling.py fit_regime_scalers /
+    # transform_by_regime): a (fold, regime) pair with fewer training
+    # samples than this raises rather than fitting a near-meaningless
+    # scaler. Empty dict default keeps this field opt-in for callers that
+    # don't do regime-conditional scaling at all.
+    min_samples_per_regime: int = 100
+    # regime name -> analog channels that carry information in that state.
+    # Every regime assign_regimes() can produce (LOADED/OFFLOAD/STOPPED/
+    # TRANSITION) must have an explicit entry when regime-conditional
+    # scaling is used -- a channel NOT listed for a regime is set to a
+    # constant 0.0 after transform (docs/FINDINGS.md §7: TP2/DV_pressure
+    # vent to ~0 when the compressor stops; their OFF-state spread is
+    # sensor noise, not signal -- scaling it would raise ~250x
+    # amplification to ~500x for no benefit). Empty by default -- opt-in.
+    active_channels: dict[str, list[str]] = Field(default_factory=dict)
+    # Warn-only (never substitutes/clamps): after fitting a regime scaler,
+    # log a WARNING naming any ACTIVE channel whose within-regime scale
+    # implies amplification (1/scale) above this factor -- surfaces future
+    # instances of the TP2-style pathology instead of hiding them.
+    amplification_warn_factor: float = 100.0
 
 
 class ResampleConfig(BaseModel):
@@ -249,6 +269,40 @@ class RegimesConfig(BaseModel):
     exclude_motor_current_when_off: bool = False
 
 
+class FeaturesConfig(BaseModel):
+    """Causal cycle-timing features (features/cycles.py) -- duration and
+    pressure-decay families, both built so a later baseline pass can
+    choose between them on evidence (docs/FINDINGS.md §8).
+    """
+
+    model_config = _STRICT
+
+    # Pressure channel the decay-rate family reads. Reservoirs is the
+    # default; TP3 is a near-duplicate (docs/FINDINGS.md §5) and is an
+    # equally valid alternative, never hardcoded.
+    decay_source_channel: str = "Reservoirs"
+    # decay_rate_running is NaN until this many samples have accumulated
+    # within the current run -- a slope from 1-2 points is noise.
+    decay_min_samples: int = 3
+    # What counts as a data gap for run-boundary purposes here -- matches
+    # the convention established in analysis.monthly_gap_and_stopped_summary
+    # (docs/FINDINGS.md §9): a run split by a gap this long or longer gets
+    # an invalid (NaN) duration but keeps a valid decay rate over its
+    # observed samples. Pandas duration string.
+    gap_threshold: str = "1min"
+    # Trailing window for baseline-relative (value / trailing_median)
+    # variants. Pandas duration string. 7 days is a deliberate choice, not
+    # a default to take for granted -- see features/cycles.py docstring:
+    # short enough that event 2's ~3x step change survives it, long enough
+    # that gradual seasonal drift (docs/FINDINGS.md §8) isn't itself
+    # absorbed into "normal".
+    baseline_window: str = "7D"
+    # Trailing window for duty_ratio_trailing (LOADED fraction of time) --
+    # deliberately much shorter than baseline_window: this is a
+    # current-state indicator, not a drift baseline.
+    duty_ratio_window: str = "1h"
+
+
 class Settings(BaseSettings):
     """Top-level, merged config for a single run."""
 
@@ -261,6 +315,7 @@ class Settings(BaseSettings):
     scaling: ScalingConfig
     windowing: WindowingConfig
     regimes: RegimesConfig
+    features: FeaturesConfig
     train: TrainConfig
     model: dict = Field(default_factory=dict)
 
