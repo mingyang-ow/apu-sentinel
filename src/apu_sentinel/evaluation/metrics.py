@@ -7,7 +7,7 @@ hold-time/hysteresis + gap-awareness rule, categorising episodes
 time, false-alarm rate, and attaching each episode's mixed ranked
 diagnosis (from explain/) happens here -- models (models/) never touch
 this. If the harness needs something a model doesn't provide (see
-models/base.py's AnomalyModel contract: scores + channel_contributions),
+models/base.py's AnomalyModel contract: scores + contributions),
 that is a contract problem to raise, not to work around.
 
 Primary objective is RECALL; false-alarm rate is a monitored secondary
@@ -57,14 +57,20 @@ class FoldEvaluation:
 class ScoredTestData:
     """A model's already-computed output for one fold's test period, plus
     the context needed to score it -- exactly the models/base.py
-    AnomalyModel contract (scores, channel_contributions) plus the
-    make_windows end-timestamps and channel names/expected_interval, and
-    nothing more. Bundled to keep evaluate_fold's signature manageable.
+    AnomalyModel contract (scores, contributions) plus the make_windows
+    end-timestamps and contributor names/expected_interval, and nothing
+    more. Bundled to keep evaluate_fold's signature manageable.
+
+    channel_names is populated from the MODEL's own contributor_names
+    (models/base.py), never from config -- a rule-based model's
+    contributors are rule names, not scaling.analog_columns, so hardcoding
+    a config channel list here would be wrong for any non-channel-attributing
+    model.
     """
 
     timestamps: pd.DatetimeIndex
     scores: np.ndarray
-    contributions: np.ndarray  # shape (n_timestamps, n_channels)
+    contributions: np.ndarray  # shape (n_timestamps, n_contributors)
     channel_names: tuple[str, ...]
     expected_interval: pd.Timedelta
 

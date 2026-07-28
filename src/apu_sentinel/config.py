@@ -303,6 +303,58 @@ class FeaturesConfig(BaseModel):
     duty_ratio_window: str = "1h"
 
 
+class RuleConfig(BaseModel):
+    """One rule's enable flag, plus an optional channel override.
+
+    Every rule shares this same {enabled, source_channel} shape even though
+    only fast_pressure_decay currently reads source_channel -- a uniform
+    per-rule shape is simpler than a one-off schema per rule.
+    """
+
+    model_config = _STRICT
+
+    enabled: bool = True
+    # Only read by fast_pressure_decay; ignored by every other rule. None
+    # means "use that rule's own hardcoded default channel".
+    source_channel: str | None = None
+
+
+class RuleBasedModelConfig(BaseModel):
+    """models/rule_based.py: calibration window + rule selection.
+
+    Rule-based "fitting" calibrates comparability (each enabled rule's
+    training-distribution quantiles), it does not learn parameters -- see
+    models/rule_based.py module docstring. baseline_window is the trailing
+    window each ratio-based rule (short_stopped_duration,
+    fast_pressure_decay, low_peak_pressure) divides its raw quantity by,
+    deliberately a model-level setting rather than reusing
+    features.baseline_window, so the model's own drift-robustness tradeoff
+    (docs/FINDINGS.md §8) can be tuned independently of feature engineering.
+    """
+
+    model_config = _STRICT
+
+    baseline_window: str = "7D"
+    # Keyed by rule name (short_stopped_duration, fast_pressure_decay,
+    # low_peak_pressure, high_duty_ratio). A rule absent from this dict is
+    # treated as disabled, same as an explicit {enabled: false}.
+    rules: dict[str, RuleConfig] = Field(default_factory=dict)
+
+
+class ModelConfig(BaseModel):
+    """Container for the currently-selected model's own config subtree.
+
+    Exactly one of these is populated per the model progression in
+    CLAUDE.md (rule-based -> isolation forest -> autoencoder); later passes
+    add their own optional field here as each model is implemented, never
+    requiring all of them at once.
+    """
+
+    model_config = _STRICT
+
+    rule_based: RuleBasedModelConfig | None = None
+
+
 class Settings(BaseSettings):
     """Top-level, merged config for a single run."""
 
@@ -317,7 +369,7 @@ class Settings(BaseSettings):
     regimes: RegimesConfig
     features: FeaturesConfig
     train: TrainConfig
-    model: dict = Field(default_factory=dict)
+    model: ModelConfig = Field(default_factory=ModelConfig)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:

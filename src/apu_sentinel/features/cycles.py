@@ -240,6 +240,49 @@ def _cycle_period_last(n: int, segments: list[_RunSegment], index: pd.DatetimeIn
     return values
 
 
+def last_completed_run_peak(
+    df: pd.DataFrame,
+    regimes: pd.Series,
+    settings,
+    target_label: str,
+    channel: str,
+) -> pd.Series:
+    """Forward-filled peak (max) of `channel` over the most recently
+    COMPLETED run labelled `target_label` -- same last-completed-forward-
+    fill causality as stopped_duration_last (module docstring): a run's
+    peak only becomes knowable once its END boundary is crossed, never
+    from the run containing the current row itself.
+
+    Treated like the duration family (null_if_gap_truncated=True), not the
+    decay-rate family: a run cut short by a data gap may not have reached
+    its true peak yet, so a gap-truncated run's observed peak is dropped
+    (NaN) rather than kept as if it were the genuine peak.
+
+    `settings` must expose `settings.features.gap_threshold` -- the shape
+    of apu_sentinel.config.Settings.
+
+    Raises:
+        ValueError: if df and regimes are misaligned, or if `channel` is
+            not a column of df.
+    """
+    if len(df) != len(regimes) or not df.index.equals(regimes.index):
+        raise ValueError("df and regimes must share the same index")
+    if channel not in df.columns:
+        raise ValueError(f"channel {channel!r} not found in df (columns: {list(df.columns)})")
+
+    gap_threshold = pd.Timedelta(settings.features.gap_threshold)
+    segments = _run_segments(regimes, gap_threshold)
+    channel_values = df[channel].to_numpy(dtype=float)
+
+    def peak_fn(seg: _RunSegment) -> float:
+        return float(np.max(channel_values[seg.start_idx : seg.end_idx + 1]))
+
+    values, _ = _last_completed_forward_fill(
+        len(df), segments, target_label, peak_fn, null_if_gap_truncated=True
+    )
+    return pd.Series(values, index=df.index)
+
+
 def _duty_ratio_trailing(regimes: pd.Series, window: pd.Timedelta) -> pd.Series:
     """LOADED fraction of time over a trailing window. pandas time-based
     .rolling() is backward-looking only (never centered), so this is

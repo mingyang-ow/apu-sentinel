@@ -10,11 +10,15 @@ import numpy as np
 
 
 class AutoencoderModel:
+    @property
+    def contributor_names(self) -> tuple[str, ...]:
+        return ()
+
     def fit(self, train_data) -> None:
         raise NotImplementedError
 
     def score(self, data) -> np.ndarray:
         raise NotImplementedError
 
-    def channel_contributions(self, data) -> np.ndarray:
+    def contributions(self, data) -> np.ndarray:
         raise NotImplementedError

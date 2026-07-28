@@ -138,13 +138,22 @@ scaling:
   # starved cell rather than fitting a near-meaningless scaler.
   min_samples_per_regime: 100
   # Which analog channels carry information in each regime -- every regime
-  # assign_regimes() can produce MUST have an entry. TP2/DV_pressure vent
-  # to ~0 when the compressor stops (median shift STOPPED-vs-OFFLOAD is
-  # exactly 0.000, docs/FINDINGS.md §7) -- their spread there is sensor
-  # noise, not signal, so scaling them would raise ~250x amplification to
-  # ~500x for zero benefit. Inactive in STOPPED/OFFLOAD, active in LOADED.
-  # TRANSITION is a genuine mixture state (docs/FINDINGS.md §7a) with no
-  # evidence yet to exclude anything -- conservatively, all channels active.
+  # assign_regimes() can produce MUST have an entry. Evidence, per channel
+  # (docs/FINDINGS.md §7/§9/§11):
+  #   - TP2 / DV_pressure vent to ~0 outside LOADED (median shift
+  #     STOPPED-vs-OFFLOAD is exactly 0.000) -- their spread elsewhere is
+  #     sensor noise, not signal. Inactive outside LOADED.
+  #   - H1 is the mirror case: vented during LOADED (median -0.010, IQR
+  #     0.006) but alive in the OFF states. Inactive in LOADED, active in
+  #     OFFLOAD/STOPPED.
+  #   - Motor_current is excluded from STOPPED: STOPPED is *defined* by
+  #     Motor_current falling below offload_current_threshold, so scoring
+  #     it there is circular (CLAUDE.md rule 7), and its within-STOPPED
+  #     amplification is ~200x (a mechanical consequence of that same
+  #     definition, not new signal).
+  # TRANSITION is a genuine mixture state (docs/FINDINGS.md §7a); its
+  # active-channel list is a conservative subset of what's alive in both
+  # states it mixes.
   active_channels:
     LOADED:
       [TP2, TP3, DV_pressure, Reservoirs, Oil_temperature, Motor_current]
@@ -266,4 +275,16 @@ features:
   # not a drift baseline, so deliberately much shorter than baseline_window.
   duty_ratio_window: 1h
 
-model: {}
+model:
+  rule_based:
+    # Trailing window for baseline-relative (value / trailing_median)
+    # calibration in short_stopped_duration, fast_pressure_decay, and
+    # low_peak_pressure -- deliberately a model-level setting, independent
+    # of features.baseline_window, so this model's drift-robustness
+    # tradeoff (docs/FINDINGS.md §8) can be tuned on its own.
+    baseline_window: 7D
+    rules:
+      short_stopped_duration: { enabled: true }
+      fast_pressure_decay: { enabled: true, source_channel: Reservoirs }
+      low_peak_pressure: { enabled: true }
+      high_duty_ratio: { enabled: true }

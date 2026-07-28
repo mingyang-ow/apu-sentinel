@@ -355,6 +355,25 @@ masking). The latter is cleaner.
   coincided with a failure; it did not (see §3). The zip-archive SHA256 in §1
   was independently re-verified against the file on disk before being recorded
   here, following the same principle.
+- **Contract test caught a design gap before it became rework (pass 12).**
+  `models/base.py`'s original `AnomalyModel` protocol promised
+  `channel_contributions`: per-timestamp, per-CHANNEL attribution. That fits
+  an autoencoder, where per-channel reconstruction error is free. It does
+  NOT fit a rule-based model, whose interpretable unit of attribution is
+  *which rule fired* (e.g. `short_stopped_duration`), not a raw channel —
+  several rules read the same channel (`Reservoirs`), and one rule
+  (`high_duty_ratio`) doesn't read a raw channel at all. Writing the first
+  real model against the contract test (`tests/test_eval_contract.py`)
+  surfaced this mismatch immediately, before a second model existed to make
+  the fix harder. Resolution: renamed `channel_contributions` ->
+  `contributions` and added a `contributor_names` property so each model
+  declares its own attribution vocabulary; `evaluation/`'s harness and
+  `explain/`'s ranking already took names as a parameter rather than reading
+  config, so they needed no structural change — only the wiring (a future
+  pipeline pass) must source contributor names from `model.contributor_names`,
+  never from `scaling.analog_columns`. Lesson: a contract test earns its keep
+  by being exercised against a real implementation as early as possible, not
+  just against a mock.
 
 ## 11. Regime-conditional scaling and cycle-timing features (pass 11)
 
@@ -420,3 +439,108 @@ carry `run_gap_truncated = True` at any given time (forward-filled between
 a truncated completion and the next genuine one) — confirming gap
 truncation is a real but small effect on the feature set as a whole, not a
 dominant one.
+
+## 12. Baseline results (pass 12) — first model scored end-to-end
+
+`models/rule_based.py`'s four rules (`short_stopped_duration`,
+`fast_pressure_decay`, `low_peak_pressure`, `high_duty_ratio`; MAX-aggregated
+score, per-rule fit-on-train-only calibration) run through the full
+`data -> regimes -> model -> evaluation` pipeline (`pipeline.run_pipeline`),
+on the real dataset, `CONFIG=local` (device=cpu; `data.subset` is NOT applied
+— see `pipeline.py` module docstring — since walk-forward folds need the
+full Feb–Aug span). Threshold: 99.5th percentile of each fold's own training
+scores. Full run (4 folds × 5 widths): ~70s on CPU.
+
+### Per-fold results across the swept window widths
+
+| event | width | detected | lead time | false episodes | false alarms/day | coverage | top rule (detecting episode) |
+|---|---|---|---|---|---|---|---|
+| 1 | 6h  | no  | —        | 3 | 0.855 | 0.829 | — |
+| 1 | 12h | no  | —        | 3 | 0.855 | 0.829 | — |
+| 1 | 24h | **yes** | 0d19h20m | 2 | 0.570 | 0.729 | `low_peak_pressure` (0.999) |
+| 1 | 48h | **yes** | 1d21h31m | 1 | 0.285 | 0.829 | `low_peak_pressure` (0.998) |
+| 1 | 72h | **yes** | **2d22h57m** | 0 | 0.000 | 0.878 | `low_peak_pressure` (0.997) |
+| 2 | 6h–72h | no | — | 1 | 0.277 | 0.86–1.00 | — |
+| 3 | 6h–72h | no | — | 0 | 0.000 | 0.84–1.00 | — |
+| 4 | 6h  | no  | —        | 3 | 1.100 | 1.000 | — |
+| 4 | 12h | no  | —        | 3 | 1.100 | 1.000 | — |
+| 4 | 24h | **yes** | **0d17h01m** | 2 | 0.733 | 0.716 | `low_peak_pressure` (0.997) |
+| 4 | 48h | **yes** | 0d17h01m | 2 | 0.733 | 0.702 | `low_peak_pressure` (0.997) |
+| 4 | 72h | **yes** | 0d17h01m | 2 | 0.733 | 0.704 | `low_peak_pressure` (0.997) |
+
+Event 4's coverage (~0.70–0.72) matches §3's independently-predicted value
+almost exactly, cross-validating both the coverage calculation and the gap
+accounting.
+
+### Cross-fold summary
+
+- **2 of 4 events detected** at width ≥ 24h: **event 1** (lead time up to
+  2d22h57m at 72h) and **event 4** (lead time steady at ~17h from 24h width
+  onward — the detecting episode is the same one at every width ≥ 24h,
+  since 2020-07-14's episode is the only qualifying candidate in range).
+- **False-alarm rate range** (at 72h, the primary width): **0.000–0.733/day**
+  across the four folds; pooling all widths, 0.000–1.100/day.
+- This is a legitimate "2 of 4" baseline result, matching CLAUDE.md's
+  stated expectation — but via a **different pair of events, and a
+  different dominant rule, than §8's duration-only analysis anticipated**.
+  §8 analyzed ONLY `stopped_duration_last`, which is clear for events 2 and
+  4 and absent for 1 and 3. The full 4-rule ensemble instead detects
+  **events 1 and 4**, both driven by `low_peak_pressure` — a signal §8 never
+  examined (it is new in this pass). Two independent, verified explanations
+  for the divergence, not a bug:
+  - **Event 2 is a real miss caused by the documented 72h cap, not an
+    absent signal.** Directly inspecting `stopped_duration_last_rel_baseline`
+    in the real data confirms §8's collapse (daily mean ratio falls to
+    0.14–0.42 during 2020-05-17 to 05-21, `short_stopped_duration` severity
+    peaking at 0.98–0.999 on several of those days) — but the ratio has
+    already recovered to ≥1.0 by 2020-05-24, three days before the 72h
+    pre-failure window (2020-05-26 23:30 onward) even opens. This is
+    exactly the gap CLAUDE.md's "Pre-failure window width" section warns
+    about: the precursor is real and ~10 days out, well past the swept cap.
+  - **Event 1's detection is a genuinely new, physically-verified signal.**
+    The detecting episode (2020-04-15 01:02–01:16) corresponds to a real
+    OFFLOAD-run peak of **8.49 bar** against a nominal ~9.9–10.0 bar
+    (confirmed by direct inspection of `last_completed_run_peak`'s raw,
+    pre-baseline-relative output) — a genuine ~1.4 bar shortfall, not an
+    artifact. `short_stopped_duration` is ordinary for event 1 (§8), so this
+    finding is additive, not contradictory.
+
+### Unreported-anomaly episode (early March), confirmed again
+
+Per §8/§9, running the fitted fold-1 model's own threshold back over its
+training period (2020-02-01 to 2020-04-13, i.e. purely descriptive — no
+evaluation harness involvement, since no fold's TEST period ever includes
+March) surfaces a **dense cluster of 8 above-threshold episodes between
+2020-03-03 and 2020-03-12**, versus 1–2 episodes per ~week elsewhere in
+Feb/late-March/April:
+
+| start | top rule (severity) | 2nd rule (severity) |
+|---|---|---|
+| 2020-03-03 02:52 | `low_peak_pressure` (0.999) | `high_duty_ratio` (0.891) |
+| 2020-03-03 12:23 | `short_stopped_duration` (0.998) | `fast_pressure_decay` (0.985) |
+| 2020-03-03 21:57 | `short_stopped_duration` (0.999) | `low_peak_pressure` (0.872) |
+| 2020-03-04 04:58 | `low_peak_pressure` (0.997) | `short_stopped_duration` (0.964) |
+| 2020-03-09 06:14 | `short_stopped_duration` (0.999) | `high_duty_ratio` (0.826) |
+| 2020-03-10 00:37 | `low_peak_pressure` (0.998) | `high_duty_ratio` (0.846) |
+| 2020-03-11 08:31 | `short_stopped_duration` (0.999) | `high_duty_ratio` (0.860) |
+| 2020-03-11 18:12 | `low_peak_pressure` (0.998) | `fast_pressure_decay` (0.994) |
+| 2020-03-12 15:29 | `low_peak_pressure` (1.000) | `high_duty_ratio` (0.910) |
+
+This is reported as-is, per the brief: **not** reclassified as a success
+(no documented failure exists here) and **not** buried. It corroborates
+§8's independent early-March observation with a second, differently-derived
+signal (`low_peak_pressure`, not just duration), strengthening rather than
+merely repeating the earlier finding. It remains unresolvable from the
+available labels — an unreported event or near-miss, not a labelling
+target.
+
+### Process note
+
+`models/rule_based.py`'s max-of-4-rules score, thresholded at each fold's
+OWN 99.5th percentile, reproduces roughly 0.5% exceedance on that same
+training data by construction (a threshold fit against the empirical CDF of
+the score it will be applied to) — the ~26 training-period episodes over
+fold 1's 71-day training window (~1 every 2–3 days) is consistent with this,
+not evidence of a bug. This is expected of any percentile-threshold
+approach and is the reason false-alarm rate is a MONITORED secondary
+(CLAUDE.md), not a pass/fail gate.

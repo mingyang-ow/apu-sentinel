@@ -28,10 +28,20 @@ class MockAnomalyModel:
     before one exists.
     """
 
-    def __init__(self, planted_scores: np.ndarray, planted_contributions: np.ndarray):
+    def __init__(
+        self,
+        planted_scores: np.ndarray,
+        planted_contributions: np.ndarray,
+        contributor_names: tuple[str, ...] = (),
+    ):
         self._planted_scores = planted_scores
         self._planted_contributions = planted_contributions
+        self._contributor_names = contributor_names
         self.fitted_on = None
+
+    @property
+    def contributor_names(self) -> tuple[str, ...]:
+        return self._contributor_names
 
     def fit(self, train_data) -> None:
         self.fitted_on = train_data
@@ -40,7 +50,7 @@ class MockAnomalyModel:
         assert len(data) == len(self._planted_scores)
         return self._planted_scores
 
-    def channel_contributions(self, data) -> np.ndarray:
+    def contributions(self, data) -> np.ndarray:
         assert len(data) == len(self._planted_contributions)
         return self._planted_contributions
 
@@ -70,7 +80,7 @@ def test_evaluator_detects_planted_failure(metrics_settings, metrics_channel_nam
     contributions = np.zeros((n, n_channels))
     contributions[episode_mask, 0] = 5.0  # chan_a dominates the planted episode
 
-    model = MockAnomalyModel(scores, contributions)
+    model = MockAnomalyModel(scores, contributions, contributor_names=metrics_channel_names)
 
     train_data = np.zeros((100, n_channels))
     model.fit(train_data)
@@ -78,7 +88,7 @@ def test_evaluator_detects_planted_failure(metrics_settings, metrics_channel_nam
 
     test_data_tensor = np.zeros((n, n_channels))
     model_scores = model.score(test_data_tensor)
-    model_contributions = model.channel_contributions(test_data_tensor)
+    model_contributions = model.contributions(test_data_tensor)
 
     fold = Fold(
         event_id=event.id,
@@ -92,7 +102,7 @@ def test_evaluator_detects_planted_failure(metrics_settings, metrics_channel_nam
         timestamps=timestamps,
         scores=model_scores,
         contributions=model_contributions,
-        channel_names=metrics_channel_names,
+        channel_names=model.contributor_names,
         expected_interval=pd.Timedelta(minutes=10),
     )
     # A threshold-fitting train score distribution that separates the 0.1
