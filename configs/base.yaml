@@ -36,6 +36,18 @@ split:
     # (event 1 below has no maintenance entry) -- more conservative since
     # the actual repair/settle time is unknown.
     fallback_post_hours: 48
+  # Pass 18 (docs/RESULTS.md §18): guards against pass 13's failure mode --
+  # a fold squeezed to near-empty training data fits a threshold of ~0.0
+  # and turns its entire test period into one continuous episode.
+  # data/split.py raises, naming the fold and its actual remaining days, if
+  # this falls below the configured minimum. 30 days is comfortably below
+  # the tightest fold's remaining training span measured at the ADOPTED
+  # pre_margin_hours (24h, unchanged -- see below): fold 1 always has
+  # exactly 72.00 training days (no earlier event to exclude), the
+  # smallest of any fold at any margin swept. 30 catches a genuinely
+  # starved config (e.g. an accidentally-huge exclusion margin) without
+  # ever tripping on real, healthy folds.
+  min_training_days: 30.0
 
 evaluation:
   # SWEPT list of candidate pre-failure window widths (hours). A project
@@ -303,6 +315,28 @@ model:
     # of features.baseline_window, so this model's drift-robustness
     # tradeoff (docs/FINDINGS.md §8) can be tuned on its own.
     baseline_window: 7D
+    # trailing (default) | lagged -- see config.py RuleBasedModelConfig and
+    # features/cycles.py baseline_relative_lagged. Pass 16
+    # (docs/findings/12-event2-error-analysis.md) confirmed trailing mode's
+    # structural blind spot: a ratio to a TRAILING median can only see the
+    # RATE OF CHANGE of a signal, never its LEVEL -- a degradation
+    # sustained longer than baseline_window pulls its own reference down to
+    # meet it (event 2's precursor read as ratio 1.195, "better than
+    # normal", right when the window opened). lagged mode anchors the
+    # reference baseline_lag back so this cannot happen for degradations
+    # shorter than the lag. Both modes are retained as comparison arms
+    # (docs/RESULTS.md pass 17) -- trailing is not deleted or superseded.
+    baseline_mode: trailing
+    # lagged mode only. 14 days verified against the real event 2 precursor
+    # (features/cycles.py baseline_relative_lagged docstring): with
+    # baseline_window unchanged at 7D, the reference at event 2's
+    # window-open (2020-05-26 23:30) spans entirely before the 17 May
+    # collapse, giving ratio 0.274 (strongly abnormal) vs trailing's 1.195.
+    # The ~3x seasonal drift (findings/08-cycle-timing.md) plays out over
+    # ~7 months, so any single 14-day lag amounts to roughly a 7% shift --
+    # negligible against the ~3.6x signal this fixes, i.e. this lag does
+    # not reintroduce the drift problem baseline_window exists to solve.
+    baseline_lag: 14D
     rules:
       short_stopped_duration: { enabled: true }
       fast_pressure_decay: { enabled: true, source_channel: Reservoirs }

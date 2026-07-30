@@ -28,6 +28,24 @@ reviewing characterise_sampling()'s output. When enabled, empty intervals
 become NaN rows -- never forward-filled -- which make_windows treats as
 gaps exactly like a native or exclusion-driven gap: a window containing any
 NaN is dropped.
+
+Public API:
+- `SamplingCharacteristics` -- modal_interval, interval_counts, gaps (tuple
+  of (start, end, duration) exceeding gap_threshold), total_span/samples.
+- `characterise_sampling(df, gap_threshold) -> SamplingCharacteristics` --
+  raises on an empty df or fewer than 2 rows.
+- `maybe_resample(df, settings) -> pd.DataFrame` -- no-op unless
+  windowing.resample.enabled; raises if a df column is in neither
+  scaling.analog_columns nor scaling.passthrough_columns.
+- `make_windows(df, settings, stride_mode="train") -> (windows,
+  end_timestamps)` -- windows shape (n_windows, window_length, n_channels)
+  float32, channel order = analog_columns + passthrough_columns;
+  end_timestamps is each window's LAST timestamp (the score/label
+  convention downstream episode grouping depends on). `stride_mode` is
+  "train" (coarser, windowing.train_stride) or "score" (finer,
+  windowing.score_stride). Raises if window_duration exceeds
+  split.embargo_hours, if stride_mode is invalid, if df (post-resample) is
+  empty, or if an expected column is missing.
 """
 
 from __future__ import annotations
@@ -277,8 +295,6 @@ def make_windows(
             np.empty((0,), dtype=timestamps.dtype),
         )
 
-    # Zero-copy view over EVERY stride-1 window position -- no data is
-    # duplicated yet.
     all_windows = np.moveaxis(
         np.lib.stride_tricks.sliding_window_view(values, window_length, axis=0), -1, 1
     )  # (n_windows_stride1, window_length, n_channels)
@@ -287,7 +303,7 @@ def make_windows(
     start_positions_stride1 = end_positions_stride1 - (window_length - 1)
 
     selected = np.arange(0, all_windows.shape[0], stride)
-    candidate_windows = all_windows[selected]  # first real materialisation: only the strided subset
+    candidate_windows = all_windows[selected]
     candidate_end_pos = end_positions_stride1[selected]
     candidate_start_pos = start_positions_stride1[selected]
 

@@ -26,10 +26,35 @@ DataFrame with a "regime" column (assign_regimes' output: LOADED/OFFLOAD/
 STOPPED/TRANSITION) plus whichever raw analog channel columns the enabled
 rules need (default: Reservoirs) -- NOT the windowed tensors make_windows
 produces, which are shaped for a model like an autoencoder instead.
+
+Public API:
+- `RULE_ORDER` -- the four rule names in their canonical column order
+  (short_stopped_duration, fast_pressure_decay, low_peak_pressure,
+  high_duty_ratio); contributor_names / contributions always follow this
+  order, filtered to whichever are enabled in model.rule_based.rules.
+- `RuleBasedModel(settings=None)` -- implements models/base.py's
+  AnomalyModel. `settings=None` falls back to `config.load_config()` (see
+  models/base.py's zero-arg-constructible requirement). Reads
+  settings.model.rule_based (baseline_window, baseline_mode, baseline_lag,
+  rules) and settings.features (decay_min_samples, gap_threshold,
+  duty_ratio_window -- shared with the rest of the app; NOT
+  settings.features.baseline_window, which the model deliberately keeps
+  separate, see RuleBasedModelConfig's docstring in config.py).
+
+Pass 17 (docs/findings/12-event2-error-analysis.md): baseline_mode selects
+between `trailing` (baseline_relative -- the original, still-default
+behaviour) and `lagged` (baseline_relative_lagged -- anchors the reference
+baseline_lag back so a degradation sustained longer than baseline_window
+cannot pull its own baseline down to meet it). Applies to every
+baseline-relative rule (short_stopped_duration, fast_pressure_decay,
+low_peak_pressure) via the shared `_baseline_relative` dispatch -- NOT
+high_duty_ratio, which has never been baseline-relative (reads
+cycle_features.duty_ratio_trailing directly).
 """
 
 from __future__ import annotations
 
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -38,6 +63,7 @@ import pandas as pd
 from apu_sentinel.config import load_config
 from apu_sentinel.features.cycles import (
     baseline_relative,
+    baseline_relative_lagged,
     compute_cycle_features,
     last_completed_run_peak,
 )
@@ -60,6 +86,15 @@ _DIRECTION = {
     "low_peak_pressure": "low",
     "high_duty_ratio": "high",
 }
+
+# The three rules that go through _baseline_relative (baseline_mode
+# trailing/lagged) -- high_duty_ratio does not (see class docstring). Used
+# to scope pass 17's warm-up NaN policy to exactly these three, never to
+# the pre-existing, unrelated NaN gaps a raw quantity can already have for
+# other reasons (e.g. decay_rate_last is undefined for a single-sample
+# STOPPED run) -- those must keep reading as severity 0, identically in
+# both modes, exactly as before pass 17.
+_BASELINE_RELATIVE_RULES = ("short_stopped_duration", "fast_pressure_decay", "low_peak_pressure")
 
 # Peak-pressure rule reads this channel; not config-exposed since (unlike
 # fast_pressure_decay) no alternative channel is called for in the brief --
@@ -118,11 +153,17 @@ class RuleBasedModel:
         if rule_based_cfg is None:
             rules_cfg: dict = {}
             baseline_window = pd.Timedelta("7D")
+            baseline_mode = "trailing"
+            baseline_lag = pd.Timedelta("14D")
         else:
             rules_cfg = rule_based_cfg.rules
             baseline_window = pd.Timedelta(rule_based_cfg.baseline_window)
+            baseline_mode = rule_based_cfg.baseline_mode
+            baseline_lag = pd.Timedelta(rule_based_cfg.baseline_lag)
         self._rules_cfg = rules_cfg
         self._baseline_window = baseline_window
+        self._baseline_mode = baseline_mode
+        self._baseline_lag = baseline_lag
 
         self._enabled_rules = tuple(name for name in RULE_ORDER if _is_enabled(rules_cfg, name))
         self._calibration: dict[str, np.ndarray] = {}
@@ -150,6 +191,18 @@ class RuleBasedModel:
         )
         return SimpleNamespace(features=features_ns)
 
+    def _baseline_relative(self, series: pd.Series) -> pd.Series:
+        """Dispatches to trailing or lagged baseline normalisation per
+        `self._baseline_mode` (config.py RuleBasedModelConfig.baseline_mode)
+        -- the single switch every ratio-based rule (short_stopped_duration,
+        fast_pressure_decay, low_peak_pressure) goes through. high_duty_ratio
+        does NOT call this -- it reads cycle_features.duty_ratio_trailing
+        directly and has never been baseline-relative (see class docstring).
+        """
+        if self._baseline_mode == "lagged":
+            return baseline_relative_lagged(series, self._baseline_window, self._baseline_lag)
+        return baseline_relative(series, self._baseline_window)
+
     def _raw_quantities(self, df: pd.DataFrame) -> dict[str, pd.Series]:
         """Every enabled rule's raw quantity (pre-calibration), aligned to
         df.index. Computed causally throughout -- see module docstring.
@@ -167,12 +220,12 @@ class RuleBasedModel:
             cycle_features = compute_cycle_features(df[[decay_channel]], regimes, cycle_settings)
 
             if "short_stopped_duration" in self._enabled_rules:
-                raw["short_stopped_duration"] = baseline_relative(
-                    cycle_features["stopped_duration_last"], self._baseline_window
+                raw["short_stopped_duration"] = self._baseline_relative(
+                    cycle_features["stopped_duration_last"]
                 )
             if "fast_pressure_decay" in self._enabled_rules:
                 abs_decay = cycle_features["decay_rate_last"].abs()
-                raw["fast_pressure_decay"] = baseline_relative(abs_decay, self._baseline_window)
+                raw["fast_pressure_decay"] = self._baseline_relative(abs_decay)
             if "high_duty_ratio" in self._enabled_rules:
                 raw["high_duty_ratio"] = cycle_features["duty_ratio_trailing"]
 
@@ -185,9 +238,23 @@ class RuleBasedModel:
                 "OFFLOAD",
                 _LOW_PEAK_PRESSURE_CHANNEL,
             )
-            raw["low_peak_pressure"] = baseline_relative(peak, self._baseline_window)
+            raw["low_peak_pressure"] = self._baseline_relative(peak)
 
         return raw
+
+    def calibration_quantile(self, rule: str, q: float) -> float:
+        """The fitted TRAINING distribution's `q`-th quantile for `rule`'s
+        raw quantity (the sorted array fit() records) -- e.g. q=0.05 shows
+        how contaminated a fold's calibration is by degraded-but-labelled-
+        normal training data (pass 18, docs/RESULTS.md §18: this is exactly
+        the number that reads BELOW an already-fixed feature's abnormal
+        value when training exclusions don't reach far enough back). Read-
+        only -- does not change fit()/score()'s behaviour.
+
+        Raises:
+            KeyError: if `rule` was never enabled/fitted.
+        """
+        return float(np.quantile(self._calibration[rule], q))
 
     # --- fit-on-train-only calibration ----------------------------------
 
@@ -221,9 +288,36 @@ class RuleBasedModel:
         the symmetric percentile rank alone would give a merely-typical
         value on the wrong side of the median a misleadingly non-zero
         score.
+
+        NaN policy for an invalid raw quantity is UNCHANGED from before
+        pass 17 in the general case: NaN (e.g. no run has completed yet, or
+        a degenerate single-sample run leaves decay_rate_last briefly
+        undefined) reads as severity 0 -- "not firing" -- the established
+        contract every existing test relies on, in EITHER mode.
+
+        The one pass-17 addition is narrowly scoped: for the three
+        baseline-relative rules (_BASELINE_RELATIVE_RULES) in `lagged`
+        mode, a NaN raw quantity that falls inside the WARM-UP period
+        (less than baseline_lag + baseline_window of history since this
+        data's own start -- features/cycles.py baseline_relative_lagged)
+        reads as NaN severity, not 0 -- "unknown", per pass 17's brief,
+        never silently "normal". A NaN raw quantity OUTSIDE the warm-up
+        period (the single-sample-run case above, which can occur anywhere
+        in the timeline) still reads as 0 in both modes -- conflating that
+        with warm-up would corrupt explain/rank_channel_contributions's
+        aggregation for otherwise-ordinary episodes far from any fold's
+        own start. `score()`'s nanmax aggregation means a genuine warm-up
+        NaN in one rule never blots out another, already-warmed-up rule's
+        signal for the same timestamp.
         """
         raw = self._raw_quantities(data)
         severities = pd.DataFrame(index=data.index)
+        if self._baseline_mode == "lagged":
+            warmup_cutoff = self._baseline_lag + self._baseline_window
+            in_warmup = (data.index - data.index[0]) < warmup_cutoff
+        else:
+            in_warmup = np.zeros(len(data), dtype=bool)
+
         for rule in self._enabled_rules:
             series = raw[rule]
             sorted_train = self._calibration[rule]
@@ -237,7 +331,12 @@ class RuleBasedModel:
                 ramp = 1.0 - 2.0 * percentile_rank
             else:
                 ramp = 2.0 * percentile_rank - 1.0
-            severity = np.where(valid, np.clip(ramp, 0.0, 1.0), 0.0)
+
+            if rule in _BASELINE_RELATIVE_RULES:
+                nan_fill = np.where(in_warmup, np.nan, 0.0)
+            else:
+                nan_fill = 0.0
+            severity = np.where(valid, np.clip(ramp, 0.0, 1.0), nan_fill)
 
             severities[rule] = severity
         return severities
@@ -247,13 +346,31 @@ class RuleBasedModel:
     def score(self, data: pd.DataFrame) -> np.ndarray:
         """Per-timestamp anomaly score: the MAX severity across enabled
         rules -- the most-violated rule drives the alert.
+
+        NaN-aware (np.nanmax, not np.max): in `lagged` mode one rule's
+        NaN (warm-up, see _severities) must never blot out another,
+        already-valid rule's genuine severity for the same timestamp --
+        plain max() would propagate a single NaN across the whole row. Only
+        a row where EVERY enabled rule is NaN -- i.e. no rule has anything
+        to say yet -- scores NaN itself, which never crosses a threshold
+        (evaluation/metrics.py fit_threshold), so it can never open an
+        episode. In `trailing` mode severities never contain NaN (see
+        _severities), so this is unchanged from plain max().
         """
-        severities = self._severities(data)
-        return severities.to_numpy().max(axis=1)
+        severities = self._severities(data).to_numpy()
+        all_nan = np.all(np.isnan(severities), axis=1)
+        scores = np.full(len(severities), np.nan)
+        if not all_nan.all():
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                scores[~all_nan] = np.nanmax(severities[~all_nan], axis=1)
+        return scores
 
     def contributions(self, data: pd.DataFrame) -> np.ndarray:
         """Per-timestamp, per-rule severity. Column order matches
-        contributor_names. Zero where a rule has no signal yet (e.g. no
-        run of the relevant kind has completed) rather than NaN.
+        contributor_names. Zero where a rule has no signal yet in
+        `trailing` mode (e.g. no run of the relevant kind has completed);
+        NaN in `lagged` mode, which also covers warm-up -- see
+        _severities's NaN-policy docstring.
         """
         return self._severities(data).to_numpy()

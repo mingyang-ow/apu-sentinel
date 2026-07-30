@@ -1,0 +1,85 @@
+# PROJECT-STORY.md
+
+The narrative companion to `ARCHITECTURE.md`. ARCHITECTURE says *how it
+works*; this says *what happened and why*.
+
+## What the project does
+
+Watch a train compressor's sensors. Warn before an air leak causes failure.
+Don't cry wolf.
+
+Four real failures in seven months of data. That is the core constraint: too
+few examples to learn "what failure looks like", so the approach is to learn
+"what normal looks like" and flag departures.
+
+## The story so far
+
+- Built a pipeline that cannot cheat (no future information reaches the
+  model).
+- Built the scoring system **before** any model, so it could not be tuned to.
+- Found the compressor has distinct operating states that had to be handled
+  first.
+- Built a simple rule-based model. It reported 2 of 4 events caught.
+- Checked whether chance alone would do that well. It would. Honest score:
+  **0 of 4 with skill**.
+- Investigated why. Found the model's own normalisation erased the signal:
+  when degradation lasted longer than its 7-day reference window, the
+  reference slid down to meet it and the machine looked normal again
+  ("boiling frog").
+- Fixed the feature. The ratio now moves correctly (1.195 → 0.274 at event
+  2's window-open).
+- The **training calibration** then absorbed the fix the same way, one level
+  up — training data contained a week of degraded operation, so the model
+  learned degradation was normal.
+- Pass 18 addressed that at the split level. It couldn't be fixed there
+  either: the parameter that would need widening only ever excludes an
+  *earlier* event's precursor from a *later* fold, never an event's own
+  precursor from its own fold. The margin stays where it was.
+
+## The passes
+
+| # | What it built |
+|---|---|
+| 1 | Repo structure, CLAUDE.md rules, test stubs |
+| 2 | Download + checksum + loader |
+| 3 | Config loading |
+| 4 | EDA notebook, failure identification |
+| **5** | **Walk-forward split + leakage guard** |
+| **6** | **Per-fold scaling + fit-on-train-only guard** |
+| 7 | Gap-aware windowing |
+| **8** | **Evaluation harness (built before any model)** |
+| 9 | Operating regimes — found 3 states, not 2 |
+| 10 | Findings record + third state |
+| 11 | Regime-conditional scaling + cycle features |
+| **12** | **Rule-based baseline → "2 of 4"** |
+| **13** | **Null comparison → "2 of 4" was chance** |
+| 14 | Documentation reorganisation |
+| 15 | Threshold sweep → no ranking signal |
+| **16** | **Error analysis → boiling-frog bug found** |
+| 17 | Lagged baseline → feature fixed, calibration absorbed it |
+| 18 | Training-margin sweep → negative, for a verified structural reason |
+| 19 | This housekeeping pass |
+
+Bold = load-bearing. The rest support them.
+
+## The four ideas everything rests on
+
+1. **Never let the model see the future.** Split by time; fit everything on
+   training data only. Two automated guards block edits that break this.
+2. **Score by event, not by data point.** How many failures caught, how
+   early, how often crying wolf — not per-timestamp accuracy, which would
+   look good and mean nothing.
+3. **Build the scoring before the model.** Otherwise you invent a metric
+   that flatters what you built.
+4. **Compare against chance.** A model firing every 1.5 days "catches" a
+   failure within 3 days about 80% of the time by luck. This check turned 2
+   of 4 into 0 of 4.
+
+## Status
+
+Pipeline: complete and guarded. Evaluation: complete, with chance
+comparison. Models: one built, honestly measured at zero skill.
+
+Next: Isolation Forest, then an autoencoder — both scored on the same
+harness against a zero-skill bar, so any real detection is unambiguous.
+Optional extensions after that: live-data simulation, alert API, dashboard.

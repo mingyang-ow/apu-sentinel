@@ -16,6 +16,14 @@ code runs locally (CPU, small subset) and on Colab (GPU, full data);
 behaviour is selected by CONFIG, never by editing code. Env & deps managed by
 uv; Python 3.11.
 
+**Read `docs/ARCHITECTURE.md` first** for the actual pipeline order, a
+one-line-per-module responsibility table, the core contracts (`AnomalyModel`,
+`Fold`, `Episode`, `FoldEvaluation`, and pass 13's `ScoredTestData`/
+`ChanceComparison`/`PooledEvaluation`), the invariant → guard-test mapping,
+and non-obvious design decisions — it is written so a reader can answer "how
+does data get from CSV to an evaluated alert?" without opening source. The
+short list below is orientation only:
+
 - data/       loading, TIME-BASED splitting (split.py), per-fold fit-on-train-only
               scaling (scaling.py), windowing (windows.py)
 - regimes/    operating-state segmentation (compressor on/off cycles); produces
@@ -32,7 +40,13 @@ uv; Python 3.11.
 
 Empirical findings from the data are recorded in `docs/FINDINGS.md` —
 consult it before making modelling decisions. It holds *what we learned*;
-this file holds *rules for how to build*.
+this file holds *rules for how to build*. `docs/FINDINGS.md` is now an
+INDEX: it lists each topic with a one-line description and links into
+`docs/findings/NN-topic.md`, where the actual content lives (verbatim,
+unmerged, per its original section numbering). Baseline/evaluation
+RESULTS are not in `docs/findings/` at all — see `docs/RESULTS.md`, which
+reports current (null-comparison-corrected) figures first and keeps
+superseded figures below, clearly labelled and never deleted.
 
 ## Hard rules — DO NOT violate
 
@@ -55,7 +69,7 @@ this file holds *rules for how to build*.
    states: a fault on that channel could simultaneously distort the regime
    label and the score. Mitigated (not eliminated) by the near-total
    separation between the two modes (only 0.015% of OFF samples fall in
-   the 1-3A valley — see `docs/FINDINGS.md` §7), and optionally by
+   the 1-3A valley — see `docs/findings/07-regimes.md`), and optionally by
    `regimes.exclude_motor_current_when_off`. Whenever Motor_current is
    scored during an OFF-derived state, this must be documented at the call
    site.
@@ -92,15 +106,26 @@ lead-time tradeoff curve is a REPORTED RESULT of the project. Too short →
 warning too late to act on; too long → pre-failure label dilutes, detection
 degrades.
 
-The current sweep cap (72h) is a DATA-GEOMETRY CONSTRAINT — event 2 and
-event 3 are only 6 days 4 hours apart, so a wider window would swallow event
-2's post-repair recovery period into event 3's pre-failure label (see
-`data/split.py` and `docs/FINDINGS.md` §4/§8). It is NOT a domain judgement
-that 72h is the right actionable lead time — `docs/FINDINGS.md` §8 shows
-event 2's cycle-timing precursor is visible ~10 days out, well past this
-cap. Raising the cap requires either per-event window widths or masking the
-event-2/event-3 overlap from false-alarm counting (the evaluation harness
-already supports masking) — not a claim that 72h is domain-correct.
+The common sweep's cap (72h, `evaluation.window_widths`) is a
+DATA-GEOMETRY CONSTRAINT — event 2 and event 3 are only 6 days 4 hours
+apart, so a wider COMMON window would swallow event 2's post-repair
+recovery period into event 3's pre-failure label (see `data/split.py` and
+`docs/findings/04-split-design.md` / `docs/findings/08-cycle-timing.md`).
+It is NOT a domain judgement that 72h is the right actionable lead time —
+`docs/findings/08-cycle-timing.md` shows event 2's cycle-timing precursor
+is visible ~10 days out, well past this cap.
+
+Per-event window caps ARE implemented (`data/split.py`
+`event_max_width_hours`, pass 13 Part C): each event's own maximum feasible
+width, derived from its own prior-exclusion boundary, replacing the single
+global cap for a SEPARATE sensitivity fold set. This does NOT resolve the
+tradeoff above — it revealed a sharper one. `docs/RESULTS.md` §13 shows
+that widening to an event's own maximum makes "detection" nearly automatic
+regardless of model skill (`p_chance_permutation` → 1.0 once the window
+approaches the width of the test period itself), which is exactly why the
+null (chance) comparison (`evaluation/metrics.py` `evaluate_chance`) must
+accompany ANY window-width result, common or per-event, before it is
+reported as a finding.
 
 ## Model progression (each stage complete + beats the last before the next)
 
@@ -124,6 +149,32 @@ not core promises.
 configs/base.yaml = shared. local.yaml = cpu/subset/fast. colab.yaml =
 cuda/full/real-budget. Select with CONFIG=. Never hardcode paths,
 hyperparameters, device, or runtime budget — all live in config.
+
+## Code comment convention
+
+Keep code comments short and sparse. Comment **why**, not **what** — a
+non-obvious reason, a domain fact a reader could not infer, or a warning
+about a non-obvious constraint. Do not narrate obvious steps or restate what
+the code already plainly says. Docstrings are exempt — they are the
+contracts (module/function purpose, parameters, raises) and stay as
+thorough as they need to be; this rule is about inline `#` comments only.
+
+## Working conventions for build-pass briefs
+
+Text below was previously restated near-verbatim in every individual brief
+(`docs/briefs/`); state it here once and have future briefs reference it
+instead:
+
+- Nothing gets committed unless the user explicitly asks for it. Every pass
+  leaves its changes uncommitted for review, regardless of what the brief's
+  scope was.
+- Fail loud and early on anything unexpected — a bad config value, a
+  disordered timestamp, a schema-drifted column. Surface the problem; never
+  silently coerce, reorder, or "fix" it in the same pass that's supposed to
+  only be loading/validating.
+- A brief's stated scope is a hard boundary. If a pass reveals that a later
+  stage's logic would need to be touched to finish cleanly, stop and say so
+  rather than reaching ahead into the next pass.
 
 ## Do NOT
 

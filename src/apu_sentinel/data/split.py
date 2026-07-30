@@ -60,16 +60,39 @@ feasible width instead, as a SEPARATE sensitivity fold set -- the common,
 shared-max sweep (the default, unchanged) remains the cross-model-
 comparable result.
 
+Pass 18 (docs/findings/12-event2-error-analysis.md, docs/RESULTS.md §18):
+widening `training_exclusion.pre_margin_hours` to cover a precursor's full
+run-up (rather than the original fixed 24h) means TWO earlier events'
+exclusion windows can now overlap each other (not just approach a later
+event's test_start, which _check_no_window_overlap/_check_no_test_start_
+overlap already guarded). `make_folds()` now takes the UNION of overlapping
+exclusion regions before storing them on the Fold, so `train_exclusions`
+is always a set of disjoint, non-overlapping intervals -- both so
+`apply_fold()`'s masking never double-applies the same region (harmless
+there; boolean OR is idempotent) and so anything that SUMS exclusion
+lengths (`training_days_remaining()`) never double-counts an overlap.
+`split.min_training_days` guards against the failure mode pass 13
+documented: a fold whose training slice is squeezed too thin fits a
+threshold of ~0.0 and turns its entire test period into one continuous
+episode. `make_folds()` raises, naming the offending fold and its actual
+remaining days, rather than letting that recur silently.
+
 Public API:
 - `Fold` -- one fold's boundaries: train_start/train_end, test_start/
-  test_end, train_exclusions (tuple of (start, end) regions to drop from
-  training). Produced by make_folds(); consumed by apply_fold() and every
+  test_end, train_exclusions (tuple of DISJOINT (start, end) regions to
+  drop from training -- overlapping source regions already merged, pass
+  18). Produced by make_folds(); consumed by apply_fold() and every
   evaluation/ function that needs test_start/test_end.
+- `training_days_remaining(fold) -> float` -- wall-clock days of training
+  time left after `fold.train_exclusions` are removed from
+  [train_start, train_end); computed from timestamps alone (no DataFrame
+  needed) since train_exclusions are already disjoint.
 - `make_folds(settings, data_start, data_end, width_hours_by_event=None)
   -> list[Fold]` -- one Fold per documented failure event. Raises
-  ValueError on empty window_widths, insufficient lead-in data, or any
-  width (shared or per-event) that would overlap an earlier event's
-  exclusion region.
+  ValueError on empty window_widths, insufficient lead-in data, any width
+  (shared or per-event) that would overlap an earlier event's exclusion
+  region, or a fold whose remaining training days fall below
+  `split.min_training_days`.
 - `apply_fold(df, fold, strategy="time") -> (train_df, test_df)` -- slices
   df by time only; `strategy` must be "time" (a rejectable guard, not a
   real option). Gotcha: does not scale, window, or otherwise transform --
@@ -100,6 +123,43 @@ class Fold:
     test_start: pd.Timestamp
     test_end: pd.Timestamp
     train_exclusions: tuple[tuple[pd.Timestamp, pd.Timestamp], ...]
+
+
+def _merge_exclusion_windows(
+    windows: list[tuple[pd.Timestamp, pd.Timestamp]],
+) -> tuple[tuple[pd.Timestamp, pd.Timestamp], ...]:
+    """Union of possibly-overlapping [start, end) regions into disjoint,
+    sorted intervals. Same merge idea as evaluation/events.py's own
+    _merge_intervals -- duplicated locally rather than imported, since
+    data/ sits BELOW evaluation/ in the module layering (CLAUDE.md) and
+    must not depend on it.
+    """
+    if not windows:
+        return ()
+    ordered = sorted(windows)
+    merged = [ordered[0]]
+    for start, end in ordered[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def training_days_remaining(fold: Fold) -> float:
+    """Wall-clock days of TRAINING time left in `fold` after
+    `fold.train_exclusions` are removed from [train_start, train_end).
+
+    Computed from timestamps alone (no DataFrame/actual row count needed):
+    exclusions are already disjoint (see make_folds' union step), so
+    summing their lengths and subtracting once from the fold's full span is
+    exact -- never double-counting an overlap between two source events'
+    exclusion windows.
+    """
+    total_seconds = (fold.train_end - fold.train_start).total_seconds()
+    excluded_seconds = sum((end - start).total_seconds() for start, end in fold.train_exclusions)
+    return max(total_seconds - excluded_seconds, 0.0) / 86400.0
 
 
 def _exclusion_window(event, training_exclusion) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -313,16 +373,27 @@ def make_folds(
                 continue
             exclusions.append((max(excl_start, data_start), min(excl_end, train_end)))
 
-        folds.append(
-            Fold(
-                event_id=event.id,
-                train_start=data_start,
-                train_end=train_end,
-                test_start=test_start,
-                test_end=test_end,
-                train_exclusions=tuple(sorted(exclusions)),
-            )
+        fold = Fold(
+            event_id=event.id,
+            train_start=data_start,
+            train_end=train_end,
+            test_start=test_start,
+            test_end=test_end,
+            train_exclusions=_merge_exclusion_windows(exclusions),
         )
+
+        min_training_days = settings.split.min_training_days
+        remaining_days = training_days_remaining(fold)
+        if remaining_days < min_training_days:
+            raise ValueError(
+                f"event {event.id}: fold's remaining training days "
+                f"({remaining_days:.2f}) fall below split.min_training_days "
+                f"({min_training_days}) after exclusions -- widen the data span, "
+                "narrow split.training_exclusion margins, or lower "
+                "split.min_training_days if this is expected."
+            )
+
+        folds.append(fold)
     return folds
 
 
@@ -356,11 +427,24 @@ def extend_test_end_for_false_alarms(
     however, allowed to overlap another event's own EXCLUSION region (see
     above), which is the one thing that would make settle-time look like
     normal background.
+
+    Pass 18 (docs/RESULTS.md §18): a widened `training_exclusion.
+    pre_margin_hours` moves the next event's exclusion window's START
+    (not just its end) further into the past -- for close event pairs
+    (event 2/3, ~6 days apart) it can move earlier than THIS fold's own
+    test_start once the margin is wide enough, which would otherwise
+    silently produce test_end < test_start (invalid) and, propagated
+    further, an empty-window p_chance_permutation crash. Never allowed to
+    move test_end BEFORE the fold's own (un-extended) test_end -- this
+    function only ever extends forward; if the next event's exclusion has
+    already swallowed the entire would-be extension, no extra
+    false-alarm-counting time is available and test_end is left as-is.
     """
     later_events = [e for e in events_sorted if pd.Timestamp(e.start) > pd.Timestamp(event.start)]
     if later_events:
         next_event = min(later_events, key=lambda e: pd.Timestamp(e.start))
-        new_test_end, _ = _exclusion_window(next_event, training_exclusion)
+        candidate_test_end, _ = _exclusion_window(next_event, training_exclusion)
+        new_test_end = max(candidate_test_end, fold.test_end)
     else:
         new_test_end = pd.Timestamp(data_end)
 

@@ -9,6 +9,20 @@ timestamps into episodes (via hold-time), checking episodes against
 pre-failure windows (detection + lead time), counting false episodes, and
 attaching the ranked diagnosis are ALL done centrally in evaluation/. Models
 never touch the metric.
+
+`data` (the argument to fit/score/contributions) is deliberately untyped
+here -- its SHAPE is a per-model choice, not part of the contract: a
+rule-based model reads a per-timestamp DataFrame with a "regime" column
+(see models/rule_based.py), while a windowed model (autoencoder,
+isolation forest) would read make_windows()'s (windows, end_timestamps)
+tensors instead. The one universal requirement is that score()'s and
+contributions()'s output rows align 1:1 with whatever timestamps `data`
+represents, in the same order.
+
+Every model class must also be constructible with ZERO arguments
+(`ModelCls()`) -- tests/test_eval_contract.py parametrizes every model this
+way; a real model wraps a `settings=None` default that falls back to
+`config.load_config()` (see models/rule_based.py).
 """
 
 from typing import Protocol, runtime_checkable

@@ -67,6 +67,19 @@ class SplitConfig(BaseModel):
     # the longest sequence window any later windowing pass will use.
     embargo_hours: float
     training_exclusion: TrainingExclusionConfig
+    # Pass 18 (docs/RESULTS.md §18, docs/findings/09-open-questions.md):
+    # guards against the failure mode pass 13 already caught once -- a
+    # fold squeezed to near-empty training data fits a threshold of ~0.0
+    # and turns its entire test period into one continuous episode.
+    # data/split.py make_folds() raises, naming the offending fold and its
+    # actual remaining training days (training_days_remaining()), if this
+    # falls below the configured minimum. 0.0 = off (the schema default,
+    # matching this codebase's convention for opt-in guards -- e.g.
+    # min_episode_duration -- so small synthetic test fixtures that never
+    # set this explicitly aren't affected); configs/base.yaml sets the
+    # REAL, informed value (30 days) for actual runs -- see its comment and
+    # docs/RESULTS.md §18 for the real remaining-days numbers behind it.
+    min_training_days: float = 0.0
 
 
 class FailureEvent(BaseModel):
@@ -346,15 +359,34 @@ class RuleBasedModelConfig(BaseModel):
     training-distribution quantiles), it does not learn parameters -- see
     models/rule_based.py module docstring. baseline_window is the trailing
     window each ratio-based rule (short_stopped_duration,
-    fast_pressure_decay, low_peak_pressure) divides its raw quantity by,
-    deliberately a model-level setting rather than reusing
-    features.baseline_window, so the model's own drift-robustness tradeoff
-    (docs/FINDINGS.md §8) can be tuned independently of feature engineering.
+    fast_pressure_decay, low_peak_pressure -- NOT high_duty_ratio, which
+    reads cycle_features.duty_ratio_trailing directly and has never gone
+    through a baseline ratio) divides its raw quantity by, deliberately a
+    model-level setting rather than reusing features.baseline_window, so
+    the model's own drift-robustness tradeoff (docs/FINDINGS.md §8) can be
+    tuned independently of feature engineering.
     """
 
     model_config = _STRICT
 
     baseline_window: str = "7D"
+    # trailing (default): reference over [t-window, t] -- baseline_relative().
+    # lagged: reference over [t-lag-window, t-lag] -- baseline_relative_lagged().
+    # Both modes are retained as valid, config-selectable comparison arms
+    # (pass 17) -- trailing is NOT superseded, only shown to have a
+    # structural blind spot for degradation sustained longer than
+    # baseline_window (docs/findings/12-event2-error-analysis.md).
+    baseline_mode: Literal["trailing", "lagged"] = "trailing"
+    # lagged mode only: gap between "now" and the end of the reference
+    # window, so a sustained degradation lasting less than this cannot
+    # contaminate its own baseline. 14 days verified against the real event
+    # 2 precursor (features/cycles.py baseline_relative_lagged docstring):
+    # with baseline_window's own default (7D) unchanged, the reference at
+    # event 2's window-open (2020-05-26 23:30) spans 2020-04-28 -> 2020-05-05
+    # -- entirely before the 17 May collapse -- giving ratio 0.274 (strongly
+    # abnormal) versus trailing mode's 1.195 (reads as *better* than normal).
+    # Ignored when baseline_mode is "trailing".
+    baseline_lag: str = "14D"
     # Keyed by rule name (short_stopped_duration, fast_pressure_decay,
     # low_peak_pressure, high_duty_ratio). A rule absent from this dict is
     # treated as disabled, same as an explicit {enabled: false}.

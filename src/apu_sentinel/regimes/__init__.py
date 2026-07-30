@@ -45,6 +45,22 @@ means OFF/offloaded, the opposite of a naive reading. verify_flag_semantics
 determines polarity empirically (cross-referenced against Motor_current)
 and the derived polarity is recorded in config (regimes.polarity), never
 hardcoded here.
+
+Public API:
+- `verify_flag_semantics(df, settings) -> dict` -- descriptive only (not
+  causal-safe, may use the full series); per-column stats by raw value
+  plus pairwise agreement after normalising via configured polarity. Run
+  once, offline, to justify regimes.polarity -- never called from the
+  causal pipeline itself.
+- `assign_regimes(df, settings) -> pd.Series` -- the ONLY function in this
+  module callers use in the live pipeline. CAUSAL: label at t uses only
+  data at or before t (tests/test_regimes.py proves this). Returns a
+  categorical Series aligned to df.index, one of LOADED/OFFLOAD/STOPPED/
+  TRANSITION per row. Does not scale, filter, or drop rows.
+- `characterise_regimes(df, regimes, settings) -> dict` -- descriptive
+  only (may use a run's full start-to-end duration, unlike assign_regimes)
+  -- occupancy, run-length distribution, global vs. per-regime channel
+  stats. Raises on an empty regimes Series.
 """
 
 from __future__ import annotations

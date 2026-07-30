@@ -63,6 +63,7 @@ dev = [
     "ruff>=0.4",
     "pre-commit>=3.7",
     "ipykernel>=7.3.0",
+    "nbconvert>=7.17.1",
 ]
 
 [tool.ruff]

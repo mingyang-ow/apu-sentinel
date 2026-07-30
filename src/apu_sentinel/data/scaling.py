@@ -75,6 +75,22 @@ UNREPORTED anomalies -- only the four documented events can be excluded via
 data/split.py's training_exclusion -- so location/spread estimates should
 be resistant to the outliers that remain. `standard` and `minmax` are
 supported alternatives, selected via config, never hardcoded.
+
+Public API:
+- `FoldScaler` -- one regime's fitted center_/scale_ per analog column;
+  `is_fitted` is False until fit_scaler() populates them.
+- `fit_scaler(train_df, settings) -> FoldScaler` -- fits on whatever slice
+  it is given (caller's job to pass a clean training slice; this function
+  cannot detect a dirty one).
+- `transform(df, scaler) -> pd.DataFrame` -- applies an already-fitted
+  scaler; raises on an unfitted scaler or an unknown column.
+- `fit_regime_scalers(train_df, train_regimes, settings, fold_id=None) ->
+  {regime: FoldScaler}` -- one scaler per regime present in train_df;
+  raises if a (fold, regime) cell has fewer than
+  scaling.min_samples_per_regime rows.
+- `transform_by_regime(df, regimes, scalers, settings) -> pd.DataFrame` --
+  applies each row's own regime's scaler, then zeroes inactive channels;
+  raises if a regime in `regimes` has no matching fitted scaler.
 """
 
 from __future__ import annotations

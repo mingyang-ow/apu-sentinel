@@ -69,14 +69,9 @@ def monthly_gap_and_stopped_summary(
     if n == 0:
         stopped_summary = pd.DataFrame(columns=["n_stopped_runs", "median_stopped_seconds"])
     else:
-        # A run ends at EITHER a label change OR a data gap exceeding
-        # gap_threshold -- a gap inside an otherwise-contiguous STOPPED
-        # stretch must truncate it (not silently bridge it), the same
-        # concern apply_fold's exclusions and make_windows' gap-awareness
-        # already act on elsewhere in this codebase. This is precisely the
-        # mechanism being checked here: if it inflates the count of (and
-        # deflates the duration of) STOPPED runs more in some months than
-        # others, that would show up as spurious drift.
+        # A run ends at a label change OR a gap exceeding gap_threshold --
+        # a gap-truncated STOPPED run undercounts its duration, the exact
+        # mechanism this report checks for.
         value_changed = values[1:] != values[:-1]
         gap_occurred = np.diff(index.to_numpy()) > np.timedelta64(gap_threshold)
         boundary = value_changed | gap_occurred

@@ -94,6 +94,8 @@ def _settings(
     baseline_window: str = "1D",
     fast_pressure_decay_channel: str | None = None,
     duty_ratio_window: str = "1h",
+    baseline_mode: str = "trailing",
+    baseline_lag: str = "14D",
 ):
     rules = {}
     for name in RULE_ORDER:
@@ -102,7 +104,12 @@ def _settings(
             kwargs["source_channel"] = fast_pressure_decay_channel
         rules[name] = RuleConfig(**kwargs)
 
-    rule_based = RuleBasedModelConfig(baseline_window=baseline_window, rules=rules)
+    rule_based = RuleBasedModelConfig(
+        baseline_window=baseline_window,
+        baseline_mode=baseline_mode,
+        baseline_lag=baseline_lag,
+        rules=rules,
+    )
     features = FeaturesConfig(
         decay_source_channel="Reservoirs",
         decay_min_samples=3,
@@ -310,3 +317,141 @@ def test_drift_robustness_vs_step_change():
     assert drift_early < 0.3
     assert step_early > 0.4
     assert step_early > drift_early
+
+
+# --- 9-11. Lagged baseline mechanism (pass 17) -------------------------
+#
+# These three test the underlying feature function (features/cycles.py
+# baseline_relative / baseline_relative_lagged) directly against a plain
+# daily pd.Series -- the mechanism pass 16 found broken and pass 17 fixes
+# is about the BASELINE ITSELF, independent of the cycle/regime scaffold
+# the rest of this file uses. Test 12 below exercises the fix through the
+# full RuleBasedModel, where it matters (severity).
+
+
+def test_lagged_reference_excludes_recent_past():
+    """The boiling-frog failure made testable, and its fix: a signal that
+    steps down and STAYS down. Trailing mode's baseline catches up (ratio
+    back near 1.0) once `window` has elapsed since the step; lagged mode's
+    reference is still anchored before the step as long as t - lag hasn't
+    reached it yet.
+    """
+    from apu_sentinel.features.cycles import baseline_relative, baseline_relative_lagged
+
+    index = pd.date_range("2020-01-01", periods=60, freq="1D")
+    values = pd.Series([1200.0] * 20 + [300.0] * 40, index=index)  # step down at day 20, stays down
+
+    window = pd.Timedelta("7D")
+    lag = pd.Timedelta("14D")
+
+    trailing_ratio = baseline_relative(values, window)
+    lagged_ratio = baseline_relative_lagged(values, window, lag)
+
+    # Day 40+ -- 20 days after the step, well past the 7-day window -- the
+    # trailing baseline has fully caught up: boiling-frog, ratio near 1.0.
+    late_trailing = trailing_ratio.iloc[40:]
+    assert late_trailing.mean() == pytest.approx(1.0, abs=0.05)
+
+    # Day 33: t - lag = day 19, still inside the pre-step 1200 regime, so
+    # lagged mode's reference is untouched by the step -- strongly abnormal.
+    check_at = index[33]
+    assert lagged_ratio.loc[check_at] < 0.3
+
+
+def test_causality_under_lag():
+    """Severity (here: the lagged ratio itself, upstream of severity) at
+    time t is unchanged when all data after t is deleted -- across several
+    cut points, in lagged mode.
+    """
+    from apu_sentinel.features.cycles import baseline_relative_lagged
+
+    index = pd.date_range("2020-01-01", periods=80, freq="1D")
+    rng = np.random.default_rng(0)
+    values = pd.Series(1000 + rng.normal(0, 50, size=80), index=index)
+
+    window = pd.Timedelta("7D")
+    lag = pd.Timedelta("14D")
+    full_ratio = baseline_relative_lagged(values, window, lag)
+
+    for cut in (30, 50, 65, 79):
+        truncated_ratio = baseline_relative_lagged(values.iloc[: cut + 1], window, lag)
+        assert np.isclose(
+            full_ratio.iloc[cut], truncated_ratio.iloc[-1], equal_nan=True
+        ), f"cut={cut}"
+
+
+def test_warm_up_yields_nan_not_partial_baseline():
+    """Fewer than lag + window of history -- NaN, never a partial/
+    silently-shortened baseline."""
+    from apu_sentinel.features.cycles import baseline_relative_lagged
+
+    index = pd.date_range("2020-01-01", periods=40, freq="1D")
+    values = pd.Series(1000.0, index=index)
+
+    window = pd.Timedelta("7D")
+    lag = pd.Timedelta("14D")
+    ratio = baseline_relative_lagged(values, window, lag)
+
+    assert ratio.iloc[:21].isna().all()
+    assert ratio.iloc[21:].notna().all()
+
+
+# --- 12. Mode switch is behavioural (pass 17) -------------------------------
+
+
+def test_mode_switch_is_behavioural():
+    """Same input, two modes: different severities where a sustained shift
+    exists (the fix actually changes something), comparable severities for
+    a transient spike (neither mode's own window is long enough for a
+    single brief blip to move its reference, so they shouldn't diverge
+    there). window=4h/lag=8h are chosen so a single ~0.53h injected cycle
+    (the spike) is short relative to `window`, while the sustained shift
+    (80 cycles, ~42h) comfortably outlasts window+lag=12h.
+    """
+    baseline_cycles = _jittered_baseline(60)  # long enough to calibrate past warm-up
+    train_df = _make_cycle_df(baseline_cycles)
+
+    trailing_settings = _settings(
+        {"short_stopped_duration": True}, baseline_window="4h", baseline_mode="trailing"
+    )
+    lagged_settings = _settings(
+        {"short_stopped_duration": True},
+        baseline_window="4h",
+        baseline_mode="lagged",
+        baseline_lag="8h",
+    )
+    trailing_model = RuleBasedModel(trailing_settings)
+    trailing_model.fit(train_df)
+    lagged_model = RuleBasedModel(lagged_settings)
+    lagged_model.fit(train_df)
+
+    # Sustained shift: stopped_n drops and stays down far longer than window + lag.
+    sustained_cycles = _repeat({**BASE_CYCLE, "stopped_n": 40}, 80)
+    sustained_df = _make_cycle_df(baseline_cycles + sustained_cycles)
+
+    onset = train_df.index[-1] + pd.Timedelta(seconds=10)
+    # > window (4h, trailing has caught up) but < lag (8h, lagged reference
+    # is still anchored before onset).
+    check_time = onset + pd.Timedelta("6h")
+    check_idx = sustained_df.index.get_indexer([check_time], method="nearest")[0]
+
+    trailing_sustained = trailing_model.contributions(sustained_df)[check_idx, 0]
+    lagged_sustained = lagged_model.contributions(sustained_df)[check_idx, 0]
+
+    assert (
+        lagged_sustained - trailing_sustained > 0.3
+    ), f"lagged={lagged_sustained}, trailing={trailing_sustained}"
+
+    # Transient spike: a SINGLE injected cycle (~0.53h, short relative to the
+    # 4h window), immediately followed by a return to baseline.
+    spike_cycle = {**BASE_CYCLE, "stopped_n": 20, "offload_n": BASE_CYCLE["offload_n"] + 100}
+    spike_df = _make_cycle_df(baseline_cycles + [spike_cycle] + baseline_cycles)
+    n_train = len(train_df)
+    spike_end = n_train + len(_make_cycle_df([spike_cycle]))
+
+    trailing_spike = trailing_model.contributions(spike_df)[n_train:spike_end, 0].mean()
+    lagged_spike = lagged_model.contributions(spike_df)[n_train:spike_end, 0].mean()
+
+    assert (
+        abs(trailing_spike - lagged_spike) < 0.2
+    ), f"trailing={trailing_spike}, lagged={lagged_spike}"

@@ -188,6 +188,66 @@ def synthetic_split_settings_overlapping(synthetic_split_events, synthetic_train
 
 
 @pytest.fixture
+def synthetic_split_events_close_pair() -> list[FailureEvent]:
+    """Three events, the first two only 5 days apart -- close enough that a
+    WIDENED pre_margin_hours (pass 18) makes their own training-exclusion
+    regions overlap each other, while a small window_widths (2h) keeps
+    every existing overlap guard (which only reads each event's exclusion
+    END, unaffected by pre_margin_hours) satisfied regardless.
+    """
+    return [
+        FailureEvent(
+            id=1, start="2020-01-05 00:00", end="2020-01-05 04:00", maintenance="2020-01-05 08:00"
+        ),
+        FailureEvent(
+            id=2, start="2020-01-10 00:00", end="2020-01-10 04:00", maintenance="2020-01-10 06:00"
+        ),
+        FailureEvent(
+            id=3, start="2020-03-01 00:00", end="2020-03-01 04:00", maintenance="2020-03-01 08:00"
+        ),
+    ]
+
+
+@pytest.fixture
+def synthetic_split_settings_overlapping_exclusions(synthetic_split_events_close_pair):
+    """pre_margin_hours=30 + post_settle_hours=100 makes event 1's and event
+    2's own exclusion windows overlap each other (event 1 excl ends
+    2020-01-09 12:00; event 2 excl starts 2020-01-08 18:00) -- exercised via
+    event 3's fold, which purges both from its training data. window_widths
+    stays tiny (2h) and embargo small (1h) so none of the existing overlap
+    guards (which only read each earlier event's exclusion END, itself
+    unaffected by pre_margin_hours -- see data/split.py's pass-18 docstring)
+    are anywhere close to tripping.
+    """
+    training_exclusion = TrainingExclusionConfig(
+        pre_margin_hours=30, post_settle_hours=100, fallback_post_hours=100
+    )
+    split = SplitConfig(embargo_hours=1, training_exclusion=training_exclusion)
+    evaluation = EvaluationConfig(
+        window_widths=[2],
+        failure_events=synthetic_split_events_close_pair,
+    )
+    return SimpleNamespace(split=split, evaluation=evaluation)
+
+
+@pytest.fixture
+def synthetic_split_data_bounds_wide() -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Wider bounds than synthetic_split_data_bounds, covering
+    synthetic_split_events_close_pair's event 3 (2020-03-01)."""
+    return pd.Timestamp("2020-01-01 00:00"), pd.Timestamp("2020-04-01 00:00")
+
+
+@pytest.fixture
+def synthetic_split_df_wide(synthetic_split_data_bounds_wide) -> pd.DataFrame:
+    data_start, data_end = synthetic_split_data_bounds_wide
+    index = pd.date_range(data_start, data_end, freq="1h")
+    rng = np.random.default_rng(1)
+    df = pd.DataFrame({"channel_0": rng.normal(size=len(index))}, index=index)
+    df.index.name = "timestamp"
+    return df
+
+
+@pytest.fixture
 def synthetic_split_settings_test_start_overlap(
     synthetic_split_events, synthetic_training_exclusion
 ):

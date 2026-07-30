@@ -57,6 +57,28 @@ scaler statistics which must never see test data. The window is a
 deliberate tradeoff: a baseline that adapts too fast absorbs gradual
 degradation and loses the signal (boiling-frog) -- event 2's ~3x step
 change survives a 7-day baseline; slow, gradual drift would not.
+
+Public API:
+- `compute_cycle_features(df, regimes, settings) -> pd.DataFrame` -- the
+  main entry point. df + regimes must share an index (raises otherwise);
+  settings.features.decay_source_channel must be a column of df (raises
+  otherwise). Returns a frame aligned exactly to df.index with
+  stopped_duration_last, offload_duration_last, loaded_duration_last,
+  stopped_elapsed, cycle_period_last, duty_ratio_trailing, decay_rate_last,
+  decay_rate_running, run_gap_truncated, and *_rel_baseline variants of the
+  three drift-prone columns.
+- `baseline_relative(series, window) -> pd.Series` -- value /
+  trailing_median(value); reusable by callers (e.g. models/rule_based.py)
+  that need the same drift-normalisation on their OWN derived quantities.
+- `baseline_relative_lagged(series, window, lag) -> pd.Series` -- same
+  idea, but the reference is anchored `lag` back so a degradation lasting
+  less than `lag` cannot pull its own baseline down to meet it (pass 16's
+  boiling-frog fix, docs/findings/12-event2-error-analysis.md). NaN during
+  warm-up (less than `lag + window` of history), never a partial baseline.
+- `last_completed_run_peak(df, regimes, settings, target_label, channel)
+  -> pd.Series` -- forward-filled peak of `channel` over the most recently
+  COMPLETED run of `target_label`; NaN'd (not kept) when that run was
+  gap-truncated, same causal discipline as stopped_duration_last.
 """
 
 from __future__ import annotations
@@ -299,6 +321,54 @@ def baseline_relative(series: pd.Series, window: pd.Timedelta) -> pd.Series:
     docstring for the drift-normalisation tradeoff this encodes.
     """
     baseline = series.rolling(window, min_periods=1).median()
+    return series / baseline
+
+
+def baseline_relative_lagged(
+    series: pd.Series, window: pd.Timedelta, lag: pd.Timedelta
+) -> pd.Series:
+    """value / trailing_median(value) computed over a window that EXCLUDES
+    the recent past: the reference for row t is the median of `series` over
+    [t - lag - window, t - lag], never [t - window, t].
+
+    Fixes a structural blind spot in `baseline_relative()` (pass 16,
+    docs/findings/12-event2-error-analysis.md): a ratio to a TRAILING median
+    can only see the *rate of change* of a signal, never its *level* --
+    degradation that persists longer than `window` pulls the reference down
+    to meet it, so the ratio returns to ~1.0 while the absolute value stays
+    depressed (boiling-frog). Anchoring the reference `lag` back in time
+    means a degradation lasting less than `lag` cannot contaminate its own
+    baseline, at the cost of the reference itself being `lag` stale.
+
+    Still CAUSAL: the reference for row t only ever reads samples at or
+    before t - lag, strictly before t. Implemented as an as-of (backward)
+    lookup, not a fixed-offset shift, so it degrades gracefully across the
+    dataset's irregular sampling/gaps exactly like `baseline_relative`'s own
+    rolling median does.
+
+    WARM-UP: rows less than `lag + window` past the series' own start have
+    no valid reference and are set to NaN -- never a partial/shortened
+    baseline (see module docstring's gap-truncation discipline: an invalid
+    reference must read as "unknown", not be silently substituted with one
+    computed from less data than requested). This requires strictly more
+    than `min_periods=1`'s "some data" -- the trailing median feeding the
+    reference is itself masked to NaN until a full `window` of elapsed
+    CALENDAR time (not sample count) has passed since `series.index[0]`.
+
+    Drift note (docs/findings/08-cycle-timing.md): the ~3x seasonal
+    STOPPED-duration drift plays out over ~7 months: over any single
+    `lag`-sized gap (default 14 days) it amounts to roughly a 7% shift --
+    negligible against the ~3.6x signal this fixes (findings/12). A 14-day
+    lag does not reintroduce the drift problem `baseline_window` exists to
+    solve.
+    """
+    trailing = series.rolling(window, min_periods=1).median()
+    elapsed_since_start = trailing.index - trailing.index[0]
+    trailing = trailing.where(elapsed_since_start >= window)
+
+    shifted_index = trailing.index + lag
+    lookup = pd.Series(trailing.to_numpy(), index=shifted_index)
+    baseline = lookup.reindex(series.index, method="ffill")
     return series / baseline
 
 

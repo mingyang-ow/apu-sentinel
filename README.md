@@ -5,6 +5,17 @@ compressor telemetry from a metro train). Anomaly / early-warning framing,
 not supervised failure classification — see `CLAUDE.md` for the full project
 contract and hard rules.
 
+## Documentation map
+
+- **[`docs/PROJECT-STORY.md`](docs/PROJECT-STORY.md)** — what this project
+  does and why, and the story of how it got here, pass by pass.
+- **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** — how it works: pipeline
+  order, module responsibilities, contracts, invariants.
+- **[`docs/FINDINGS.md`](docs/FINDINGS.md)** — what we learned from the data
+  (index into `docs/findings/`).
+- **[`docs/RESULTS.md`](docs/RESULTS.md)** — the numbers: baseline/evaluation
+  results, current first, superseded kept below.
+
 ## Quickstart
 
 ```bash
