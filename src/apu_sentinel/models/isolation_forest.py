@@ -55,7 +55,10 @@ Public API:
   contributions() for ablation.
 - `IsolationForestModel(settings=None)` -- implements AnomalyModel. One
   instance per fold (models/isolation_forest.py has no cross-fold state);
-  `fit()` on a fold's clean training windows only.
+  `fit()` on a fold's clean training windows only. `explain_episode(episode,
+  data)` runs the same ablation restricted to one episode's own windows,
+  ignoring `contributions.enabled` -- the cheap path for the handful of
+  flagged detections a sweep actually needs explained.
 """
 
 from __future__ import annotations
@@ -68,6 +71,7 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest
 
 from apu_sentinel.config import load_config
+from apu_sentinel.explain import rank_channel_contributions
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +231,7 @@ class IsolationForestModel:
             n_estimators=self._cfg.n_estimators,
             max_samples=self._cfg.max_samples,
             random_state=self._cfg.random_state,
+            n_jobs=self._cfg.n_jobs,
         )
         self._forest.fit(matrix)
         logger.info(
@@ -275,3 +280,48 @@ class IsolationForestModel:
             ablated_scores = -self._forest.score_samples(ablated)
             contributions[:, j] = full_scores - ablated_scores
         return contributions
+
+    def explain_episode(self, episode, data: WindowedInput) -> tuple[tuple[str, float], ...]:
+        """Ablation attribution restricted to ONE episode's own windows --
+        for the handful of flagged detections (e.g.
+        p_chance_permutation < evaluation.chance_threshold), never for a
+        full fold's sweep: that is exactly what
+        `contributions.enabled: false` (the default) avoids paying.
+        Ignores `contributions.enabled` -- an explicit, single-episode call
+        is cheap regardless of that flag.
+
+        Returns the same ranked (channel, contribution) shape
+        explain/rank_channel_contributions produces for a whole episode.
+
+        Raises:
+            ValueError: if no timestamp in data.end_timestamps falls in
+                [episode.start, episode.end].
+        """
+        mask = (data.end_timestamps >= episode.start) & (data.end_timestamps <= episode.end)
+        episode_data = WindowedInput(
+            windows=data.windows[mask],
+            end_timestamps=data.end_timestamps[mask],
+            channel_names=data.channel_names,
+            cycle_features=data.cycle_features,
+        )
+        matrix, _ = build_feature_matrix(episode_data, self._settings)
+        if matrix.shape[0] == 0:
+            raise ValueError(
+                f"no timestamps in data fall within episode [{episode.start}, {episode.end}]"
+            )
+        matrix = self._fill_nan(matrix)
+        full_scores = -self._forest.score_samples(matrix)
+
+        n_features = len(self._feature_names)
+        contributions = np.zeros((matrix.shape[0], n_features))
+        for j in range(n_features):
+            ablated = matrix.copy()
+            ablated[:, j] = self._medians[j]
+            ablated_scores = -self._forest.score_samples(ablated)
+            contributions[:, j] = full_scores - ablated_scores
+
+        return rank_channel_contributions(
+            contributions,
+            self._feature_names,
+            method=self._settings.evaluation.contribution_aggregation,
+        )

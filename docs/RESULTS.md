@@ -10,6 +10,8 @@ the record, the same principle as the April-gap correction in
 ## Contents
 
 **Current**
+- [22. Event-4 detection validation: gap-artifact check negative, no aggregate skill at the pre-registered operating point (pass 22)](#22-event-4-detection-validation-gap-artifact-check-negative-no-aggregate-skill-at-the-pre-registered-operating-point-pass-22)
+- [21. Isolation Forest: arm A/B + quantile sweep, explained detections (pass 21)](#21-isolation-forest-arm-ab--quantile-sweep-explained-detections-pass-21)
 - [20. Exclusion-selection fix (overlap-based) — the lever now reaches, and it still isn't enough (pass 20)](#20-exclusion-selection-fix-overlap-based--the-lever-now-reaches-and-it-still-isnt-enough-pass-20)
 - [17. Lagged baseline — fixes the mechanism, does not change the verdict (pass 17)](#17-lagged-baseline--fixes-the-mechanism-does-not-change-the-verdict-pass-17)
 - [15. Threshold sweep diagnostic (pass 15)](#15-threshold-sweep-diagnostic-pass-15)
@@ -23,7 +25,329 @@ the record, the same principle as the April-gap correction in
 
 ## Current results
 
-### 20. Exclusion-selection fix (overlap-based) — the lever now reaches, and it still isn't enough (pass 20)
+### 22. Event-4 detection validation: gap-artifact check negative, no aggregate skill at the pre-registered operating point (pass 22)
+
+§21 reported event 4 detecting at `p_chance_permutation` as low as 0.004–0.02
+— the first sub-0.10 result in the project. Three problems before that can
+be believed: (1) the sweep that produced it was 4 quantiles × 5 widths × 4
+folds × 2 arms = 160 combinations, so "p < 0.02 at best" is a maximum, not a
+p-value; (2) event 4 has the worst pre-failure window data coverage of any
+event (independently re-verified here via `evaluation/events.py`
+`window_coverage()`: **0.7044**, i.e. 21.3h of gaps inside its 72h window —
+matches the code's own long-standing comment estimating "around 0.8"), and
+gap-truncated cycle-feature runs produce NaN by design, so something is
+imputing them; (3) no single aggregate statistic was reported for one
+pre-chosen operating point.
+
+**Code changes**: `IsolationForestModelConfig.exclude_gap_adjacent_windows`
+(default `false`) — a diagnostic-only flag; when set, `pipeline.
+_build_windowed_input` drops SCORED (never training) windows whose end
+timestamp falls within one `window_duration` of a data-gap boundary
+(`pipeline.gap_adjacent_mask`/`_gap_boundaries`). `pipeline.
+pooled_at_quantiles` extends the pooled false-alarm evaluation to every
+swept quantile from one scoring pass (needed for Part B below).
+`scripts/isolation_forest_experiment.py` gained `--widths`/`--quantiles`
+(restrict the grid)/`--only-folds`/`--exclude-gap-adjacent`/`--tag`.
+New `scripts/isolation_forest_gap_diagnostic.py` for Part A2's measurement.
+
+#### Part A1 — the NaN handling mechanism
+
+Traced from `features/cycles.py` to the model: a gap-truncated STOPPED run
+(or warm-up before any run has completed, or `baseline_relative_lagged`'s
+own warm-up masking) produces `NaN` in one or more cycle-feature columns.
+`build_feature_matrix` passes these straight through — **`IsolationForest.
+fit`/`score_samples` never see a raw NaN**, because `IsolationForestModel.
+_fill_nan()` (models/isolation_forest.py) replaces every NaN with that
+FEATURE'S OWN TRAINING-SET MEDIAN (`np.nanmedian`, computed once at `fit()`
+and reused identically at `score`/`contributions`/`explain_episode`).
+Windows are never dropped for having a NaN cycle feature (only for the
+window's own raw channels spanning a gap, in `make_windows`). This
+mechanism was already documented in `_fill_nan`'s own docstring, but had
+not been called out at the pipeline/evaluation level as a possible
+gap-adjacency confound — it is now, explicitly, here.
+
+#### Part A2 — gap adjacency of event 4's detecting episodes
+
+`gap_adjacent_mask`: an end timestamp counts as gap-adjacent if it falls
+within one `window_duration` (30min) of EITHER boundary of a data gap
+(`windowing.gap_threshold`, 5min) inside `train_start..test_end`.
+
+- **Baseline** (all scored test-period windows, fold 4): 305/11,788 =
+  **2.6%** gap-adjacent — identical in both arms (gap positions in the test
+  period don't depend on arm; only training is affected by the March
+  exclusion).
+- **Every flagged detecting episode** (`p_chance_permutation <
+  evaluation.chance_threshold`, i.e. 0.10): **26 distinct (quantile,
+  episode) pairs in arm A, 28 in arm B — every single one has ZERO
+  gap-adjacent windows** (0/n for n ranging 1–26 windows per episode).
+
+Detecting episodes are, if anything, LESS gap-adjacent than the fold-wide
+baseline (0% vs. 2.6%) — the opposite of what the gap-artifact hypothesis
+predicts.
+
+#### Part A3 — direct test: exclude gap-adjacent windows from scoring
+
+Re-scored fold 4 (both arms, sweep profile) with
+`exclude_gap_adjacent_windows: true` — dropped 1,118/47,366 (2.4%) of
+scored windows in both arms, consistent with A2's baseline fraction.
+**Every previously-flagged (width, quantile) combination remains detected
+and flagged in both arms**, at essentially unchanged — in several cases
+slightly LOWER — `p_chance_permutation`:
+
+| arm | width | quantile | p_perm (original) | p_perm (gap-excluded) |
+|---|---|---|---|---|
+| A | 6h  | 0.995  | 0.042 | 0.026 |
+| A | 6h  | 0.9995 | 0.018 | 0.008 |
+| B | 6h  | 0.9999 | 0.004 | 0.004 |
+| B | 12h | 0.995  | 0.077 | 0.046 |
+
+**Part A verdict: NOT a gap artifact.** Both the adjacency measurement and
+the direct exclusion test point the same way, in both arms.
+
+#### Part B — single pre-registered operating point
+
+Selection rule (applied on false-alarm grounds only, before looking at
+detections): the tightest quantile whose POOLED false-alarm rate is ≤
+0.3/day; width fixed at 72h (the common maximum). "Pooled rate" is
+computed per fold in this project's existing convention (§13 Part B2), so
+the rule is applied to the WORST CASE (max) across all 4 folds × both
+arms — 8 numbers per quantile, an explicit tie-break choice stated here
+since the brief's rule does not itself say how to combine folds:
+
+| quantile | max pooled fa/day (8 fold×arm combos) | ≤ 0.3/day? |
+|---|---|---|
+| 0.995  | 0.615 | no |
+| 0.999  | 0.254 | **yes** |
+| 0.9995 | 0.099 | yes |
+| 0.9999 | 0.014 | yes |
+
+**Selected: q = 0.999, width = 72h** — the loosest quantile that already
+satisfies the ceiling (going tighter than necessary sacrifices sensitivity
+for no operational benefit).
+
+**Honesty note**: this operating point is chosen AFTER the §21 sweep was
+seen, so it is not a true pre-registration. The selection rule depends
+only on the pooled false-alarm rate, never on detection outcomes — but the
+limitation stands and is recorded, not glossed over.
+
+Aggregate skill statistic at (72h, 0.999), sweep profile, both arms
+(convention: `expected = Σ p_chance_permutation`; `observed` = detection
+count; `p(X≥observed)` exact Poisson-binomial survival, 4 folds):
+
+| model | observed | expected | p(X≥observed) | which events |
+|---|---|---|---|---|
+| Rule-based (trailing@24h, §20) | 2 | 2.106 | 0.737 | 1, 4 |
+| IF arm A (sweep) | 2 | 1.263 | 0.375 | 3 (weak), 4 |
+| IF arm B (sweep) | 1 | 1.426 | 0.833 | 4 only |
+
+**No aggregate skill at this single, honestly-chosen point, in either
+arm** — p stays in the 0.37–0.83 range, nowhere near conventional
+significance, and no better than the rule-based baseline's own 0.737.
+
+#### Part C — full-settings confirmation
+
+Re-ran both arms at `n_estimators=200`, `score_stride=1min` (base.yaml's
+real settings), restricted to (72h, 0.999) only — not the full sweep.
+Elapsed: arm A 41–102s/fold, arm B 41–61s/fold (fold 4 costs most, same
+reason as §21: `explain_episode` calls on its flagged episodes).
+
+| model | observed | expected | p(X≥observed) | which events |
+|---|---|---|---|---|
+| IF arm A (full settings) | 2 | 1.465 | 0.467 | 3 (weak), 4 |
+| IF arm B (full settings) | 2 | 1.512 | 0.489 | 3 (weak), 4 |
+
+**Full settings do not change the conclusion** — p moves from 0.375/0.833
+(sweep) to 0.467/0.489 (full), still nowhere near significant. Arm B
+additionally detects event 3 at full settings (sweep profile did not) —
+a real difference between profiles, but event 3's own detection stays
+weak (chance-indistinguishable) in every configuration tested, sweep or
+full.
+
+**Important scope clarification**: at this 72h/0.999 operating point,
+event 4 itself is flagged `not_distinguishable_from_chance` (`p_perm`
+0.21–0.28) in EVERY arm/profile combination here. The §21 sub-0.02 result
+lived specifically at SHORT widths (6–12h) and TIGHT quantiles
+(0.9995–0.9999) — a different, narrower (width, quantile) cell than Part
+B's pre-registered point. This is not a contradiction: it is the reason a
+single wide/loose headline point cannot represent this model, and exactly
+why §21's "p < 0.02 at best" was a maximum over the sweep, not a report
+of what happens at any one honestly-fixed operating point.
+
+#### Verdict
+
+- **Gap artifact: REJECTED.** Detecting episodes are less gap-adjacent
+  than baseline (A2), and excluding gap-adjacent windows from scoring
+  leaves every flagged detection intact or slightly stronger (A3).
+- **Multiple comparisons: CONFIRMED as the right concern.** The single
+  pre-registered (72h, 0.999) operating point shows NO aggregate skill in
+  either arm, at either model-fit profile (p = 0.37–0.83) — indistinguishable
+  from the rule-based baseline's own p = 0.737. §21's "p < 0.02 at best"
+  was the maximum over a 160-cell sweep and must not be read as a
+  validated result on its own.
+- **What survives**: event 4's detection at short widths/tight quantiles is
+  real signal, not a data-quality artifact — but it is a SINGLE-EVENT
+  finding about event 4's own precursor, never distinguishable from chance
+  at the project's common 72h width, and does not establish general
+  early-warning skill. Events 1 and 2 remain undetected everywhere in this
+  model (both arms, both profiles, every width/quantile in §21 and here).
+
+Second model in CLAUDE.md's progression (rule-based → **Isolation Forest** →
+autoencoder). This section is the first time it is actually scored:
+`models/isolation_forest.py` (one `sklearn.ensemble.IsolationForest` per
+fold, fit on window summary-stats + cycle features, `-score_samples()` as
+the anomaly score, ablation for attribution) already existed; this pass
+made it runnable at project scale and ran it.
+
+**Changes made before running**: `contributions.enabled` now defaults to
+**false** (was true) — per-timestamp ablation across a full fold's
+(width × quantile) sweep is what exhausted the CPU previously.
+`IsolationForestModel.explain_episode(episode, data)` is the replacement:
+ablation restricted to one episode's own windows, called explicitly (and
+only) for detections flagged below `evaluation.chance_threshold`
+(0.10) — cheap regardless of the config flag. `n_jobs` (default -1) is
+now config-driven and passed to the `IsolationForest` constructor.
+
+**Sweep profile** (the run reported below): `n_estimators: 100`,
+`windowing.score_stride: 5min` (vs. base.yaml's real settings of 200 /
+1min) — cheap enough to run all 4 folds × 2 arms in about 80s each. A
+**final confirmed run** at full settings has NOT been executed yet (left
+for a future pass, `--profile final` in the script below) — everything
+in this section is the sweep-profile result, not the final one.
+
+**Arms** (`split.training_exclusion.additional_regions`, sensitivity-only,
+never tied to a documented event): **arm A** = `[]` (unchanged default);
+**arm B** = early-March cluster excluded
+(`2020-03-03` → `2020-03-12`, `findings/12-event2-error-analysis.md`),
+run as a separate, later invocation — never both arms in one process.
+Quantile grid `{0.995, 0.999, 0.9995, 0.9999}` × common widths
+`{6, 12, 24, 48, 72}h`, all 4 folds, both arms
+(`scripts/isolation_forest_experiment.py`, checkpointed per fold to
+gitignored `data/interim/isolation_forest_runs/sweep_arm_{a,b}/fold_{event}.pkl`
+— a restart skips any fold already checkpointed). Elapsed time per fold:
+arm A `17.2s, 17.7s, 21.7s, 40.9s`; arm B `18.9s, 19.2s, 20.1s, 38.4s`
+(fold 4 costs more — its explained detections trigger several
+`explain_episode` calls, still cheap since each is restricted to one
+episode's own windows).
+
+#### Aggregate skill statistic — full grid, both arms
+
+Same convention as §13/§18/§20: `expected = Σ p_chance_permutation` over
+the 4 folds; `observed` = detection count; `p(X≥observed)` is the exact
+Poisson-binomial survival probability. Cells are `observed/expected/p`.
+
+**Arm A** (`additional_regions: []`):
+
+| quantile | 6h | 12h | 24h | 48h | 72h |
+|---|---|---|---|---|---|
+| 0.995  | 1/0.289/0.260 | 1/0.460/0.388 | 1/0.790/0.587 | 1/1.262/0.784 | 2/1.613/0.532 |
+| 0.999  | 1/0.174/0.163 | 1/0.312/0.278 | 1/0.555/0.450 | 1/0.965/0.670 | 2/1.263/0.375 |
+| 0.9995 | 1/0.107/0.103 | 1/0.217/0.200 | 1/0.419/0.359 | 1/0.741/0.562 | 2/0.961/0.244 |
+| 0.9999 | 0/0.004/1.000 | 0/0.010/1.000 | 0/0.018/1.000 | 1/0.040/**0.040** | 1/0.051/**0.051** |
+
+**Arm B** (March excluded):
+
+| quantile | 6h | 12h | 24h | 48h | 72h |
+|---|---|---|---|---|---|
+| 0.995  | 1/0.332/0.294 | 1/0.552/0.451 | 1/0.977/0.683 | 1/1.683/0.906 | 2/2.179/0.776 |
+| 0.999  | 1/0.204/0.190 | 1/0.367/0.320 | 1/0.669/0.522 | 1/1.102/0.730 | 1/1.426/0.833 |
+| 0.9995 | 1/0.105/0.101 | 1/0.197/0.183 | 1/0.376/0.328 | 1/0.739/0.564 | 1/1.069/0.725 |
+| 0.9999 | 1/0.004/**0.004** | 1/0.010/**0.010** | 1/0.020/**0.020** | 1/0.040/**0.040** | 1/0.062/**0.062** |
+
+**The pattern is per-event, not per-(width, quantile), and it holds in
+both arms**: events 1 and 2 are **never** detected by Isolation Forest at
+any width/quantile tested, in either arm — a first for this project
+(the rule-based baseline detects 1, not 2). Event 3 detects only at
+72h, and only weakly (`p_perm` 0.31–0.45, chance-indistinguishable every
+time). **Event 4 is the story**: detected across nearly every
+(width, quantile) cell, and at the tighter quantiles (0.9995, 0.9999) its
+`p_poisson` **and** `p_perm` both drop below 0.10 — genuinely
+distinguishable from chance. `observed` never exceeds 2 (events 3 and 4
+together, only at 72h) — no combination detects 3 of the 4 events.
+
+#### Event 4: the first genuinely non-chance detection in this project
+
+At the tightest quantiles, event 4 detects at SHORT lead times with both
+null estimates low simultaneously — the bar every prior rule-based result
+in §13/§17/§18/§20 failed to clear:
+
+| arm | width | quantile | lead time | fa/day (in-fold) | p_poisson | p_perm |
+|---|---|---|---|---|---|---|
+| A | 6h  | 0.9995 | 0d01h07m | 0.077 | 0.019 | 0.018 |
+| A | 12h | 0.9995 | 0d01h07m | 0.077 | 0.038 | 0.040 |
+| A | 48h | 0.9999 | 1d11h57m | 0.000 | 0.000 | 0.040 |
+| B | 6h  | 0.9999 | 0d01h32m | 0.000 | 0.000 | 0.004 |
+| B | 12h | 0.9999 | 0d01h32m | 0.000 | 0.000 | 0.010 |
+
+Lead time shrinks as the quantile tightens (looser thresholds catch the
+same event earlier but with more surrounding false alarms diluting the
+signal) — the usual detection/false-alarm tradeoff, now visible on a
+single event for the first time with both chance estimates this low.
+
+`explain_episode` (ablation restricted to each flagged episode's own
+windows) was run for every detection with `p_chance_permutation < 0.10`:
+26 distinct (quantile, episode) pairs in arm A and 28 in arm B (the same
+underlying episode reappears across widths sharing a quantile, since
+episode boundaries depend only on the threshold, not the width) — all of
+them fold 4 (event 4); the fold-3 detections never cross this bar.
+Counting appearances in the top-5 across the 54 distinct (quantile,
+episode) explanations (both arms combined): `MPG_mean` (29), `DV_eletric_std`
+(29), `Motor_current_max` (27), `Reservoirs_std` (22), `Reservoirs_min`
+(22), `Reservoirs_slope` (15), `TP2_slope` (11), `DV_eletric_min` (11) —
+no single channel dominates (`Reservoirs_min` is the most common top-1
+pick, in only 14 of 54), but reservoir-pressure variability and
+motor-current extremes recur far more than any other channel family. A
+representative
+episode (arm A, width=6h, q=0.995, `2020-07-15 08:35:47 → 08:45:42`):
+`Reservoirs_std=0.0129, MPG_mean=0.0127, Motor_current_min=0.0075,
+DV_eletric_std=0.0071, DV_eletric_mean=0.0071`. Full ranked lists (87
+features per episode) are in the checkpoint pickles, not reproduced here.
+
+#### Three-way comparison — rule-based vs. IF arm A vs. IF arm B
+
+At the project's established headline operating point (q=0.995, 72h),
+against the ADOPTED rule-based config (`baseline_mode: trailing`,
+`pre_margin_hours: 24h`, §20):
+
+| model | observed | expected (Σp_perm) | p(X≥observed) | which events | genuinely non-chance? |
+|---|---|---|---|---|---|
+| Rule-based (trailing@24h, §20) | 2 | 2.106 | 0.737 | 1, 4 (both flagged chance-indistinguishable) | no |
+| IF arm A | 2 | 1.613 | 0.532 | 3 (weak), 4 (weak at this width) | no *(but event 4 IS non-chance at tighter widths/quantiles — see above)* |
+| IF arm B | 2 | 2.179 | 0.776 | 3 (weak), 4 (weak at this width) | no *(same caveat)* |
+
+**At 72h/0.995 all three look similarly unremarkable** — this is exactly
+why a single headline width/quantile is insufficient for this model:
+event 4's real signal only surfaces once the quantile tightens past 0.995,
+which the rule-based model's own sweep (§15, §18, §20) never showed for
+ANY event. Isolation Forest and the rule-based baseline detect **different
+events** (4 vs. 1) rather than one dominating the other — the mixed
+per-episode diagnosis (`explain_episode`) is the only way to tell they are
+not measuring the same failure mode.
+
+#### Pooled false-alarm rate (whole-series, per fold's own model)
+
+| event | rule-based (trailing, §17) | IF arm A | IF arm B |
+|---|---|---|---|
+| 1 | 0.504 | 0.332 | 0.615 |
+| 2 | 0.385 | 0.304 | 0.530 |
+| 3 | 0.371 | 0.318 | 0.474 |
+| 4 | 0.358 | 0.368 | 0.226 |
+
+Arm A's pooled rate sits close to the rule-based baseline's across all
+four folds. **Arm B moves the pooled rate in OPPOSITE directions across
+folds**: up for events 1–3 (whose training window includes the now-excluded
+March stretch), down for event 4 (whose model ends up calibrated tighter
+without it) — removing an extreme training region does not uniformly
+quiet a fold's alarms; it can just as easily raise the bar for what counts
+as "typical" elsewhere in that same fold's training data.
+
+#### What this does NOT show
+
+Same discipline as §13 → §20: a low `p_chance_permutation` for event 4 is
+evidence of skill on **that one event**, not proof of general skill — 3
+of 4 events (1, 2, and non-trivially 3) remain undetected or chance-level
+in every cell of this sweep, in both arms. This is a SWEEP-PROFILE result
+(`n_estimators=100`, `score_stride=5min`); the full-settings confirmation
+run this finding still needs has not been executed.
 
 **Correction to §18 below**: §18 concluded `training_exclusion.pre_margin_hours`
 "was never the right lever" for event 2's calibration contamination. That

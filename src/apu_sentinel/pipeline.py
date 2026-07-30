@@ -57,6 +57,7 @@ reports, per fold:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -79,14 +80,18 @@ from apu_sentinel.evaluation.metrics import (
     ScoredTestData,
     evaluate_chance,
     evaluate_fold_at_threshold,
+    evaluate_fold_sweep,
     evaluate_pooled_stretches,
     fit_threshold,
+    fit_threshold_sweep,
 )
 from apu_sentinel.features.cycles import compute_cycle_features
 from apu_sentinel.models.base import AnomalyModel
 from apu_sentinel.models.isolation_forest import IsolationForestModel, WindowedInput
 from apu_sentinel.models.rule_based import RuleBasedModel
 from apu_sentinel.regimes import assign_regimes
+
+logger = logging.getLogger(__name__)
 
 
 def _rule_based_input_columns(settings: Settings) -> list[str]:
@@ -350,12 +355,62 @@ def _windowed_channel_names(settings: Settings) -> tuple[str, ...]:
     return tuple(settings.scaling.analog_columns) + tuple(settings.scaling.passthrough_columns)
 
 
+# --- Pass 22: gap-adjacency (docs/RESULTS.md, event-4 validation) ----------
+#
+# make_windows() already drops a window whose OWN span crosses a gap; it
+# does NOT flag a window that sits just before/after one -- exactly where a
+# cycle feature can still be NaN (a STOPPED run gap-truncated at its exit,
+# module docstring in features/cycles.py) and get imputed to the training
+# median (IsolationForestModel._fill_nan). This section measures and,
+# opt-in only, removes that vicinity from SCORING (never training).
+
+
+def _gap_boundaries(
+    index: pd.DatetimeIndex, gap_threshold: pd.Timedelta
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """(gap_start, gap_end) for every consecutive pair in `index` spaced
+    more than gap_threshold apart -- the same definition
+    data/windows.py characterise_sampling() uses, recomputed directly over
+    whatever slice is at hand (a fold's own train_start..test_end span).
+    """
+    values = index.to_numpy()
+    if len(values) < 2:
+        return []
+    deltas = np.diff(values)
+    gap_positions = np.flatnonzero(deltas > np.timedelta64(gap_threshold))
+    return [(pd.Timestamp(values[i]), pd.Timestamp(values[i + 1])) for i in gap_positions]
+
+
+def gap_adjacent_mask(
+    end_timestamps,
+    gaps: list[tuple[pd.Timestamp, pd.Timestamp]],
+    window_duration: pd.Timedelta,
+) -> np.ndarray:
+    """True where an end_timestamp falls within one window_duration of
+    EITHER boundary of any gap -- "just after a gap ended" or "about to hit
+    one", the two ways a window's history can be gap-disrupted without its
+    own span crossing the gap (that case make_windows() already drops).
+    """
+    end_timestamps = pd.DatetimeIndex(end_timestamps)
+    mask = np.zeros(len(end_timestamps), dtype=bool)
+    for gap_start, gap_end in gaps:
+        near_start = (end_timestamps >= gap_start - window_duration) & (
+            end_timestamps <= gap_start + window_duration
+        )
+        near_end = (end_timestamps >= gap_end - window_duration) & (
+            end_timestamps <= gap_end + window_duration
+        )
+        mask |= near_start | near_end
+    return mask
+
+
 def _build_windowed_input(
     raw_df: pd.DataFrame,
     regimes: pd.Series,
     scalers: dict,
     settings: Settings,
     stride_mode: str,
+    exclude_gap_adjacent: bool = False,
 ) -> WindowedInput:
     """Scale raw_df with an ALREADY-FITTED (train-only) scaler set, compute
     cycle features on the RAW channel (causal, same discipline as the
@@ -363,10 +418,28 @@ def _build_windowed_input(
     `raw_df`/`regimes` need not share an index (regimes is sliced onto
     raw_df's here); scalers must come from fit_regime_scalers() on this
     fold's clean training slice.
+
+    `exclude_gap_adjacent` (pass 22 diagnostic, model.isolation_forest.
+    exclude_gap_adjacent_windows) drops windows via gap_adjacent_mask()
+    after windowing -- callers must only set this for a SCORED input, never
+    for training data (see _fit_fold_isolation_forest).
     """
     df_regimes = regimes.loc[raw_df.index]
     scaled = transform_by_regime(raw_df, df_regimes, scalers, settings)
     windows, end_timestamps = make_windows(scaled, settings, stride_mode=stride_mode)
+
+    if exclude_gap_adjacent and len(end_timestamps) > 0:
+        gap_threshold = pd.Timedelta(settings.windowing.gap_threshold)
+        window_duration = pd.Timedelta(settings.windowing.window_duration)
+        gaps = _gap_boundaries(scaled.index, gap_threshold)
+        keep = ~gap_adjacent_mask(end_timestamps, gaps, window_duration)
+        n_dropped = int((~keep).sum())
+        logger.info(
+            "_build_windowed_input: exclude_gap_adjacent_windows dropped %d/%d windows",
+            n_dropped,
+            len(end_timestamps),
+        )
+        windows, end_timestamps = windows[keep], end_timestamps[keep]
 
     cycle_features = None
     if settings.model.isolation_forest.include_cycle_features:
@@ -394,6 +467,12 @@ def _fit_fold_isolation_forest(
     exclusion-purged training slice alone. `scalers` is returned too since
     _evaluate_pooled_for_fold_windowed needs the SAME fitted scalers to
     score pooled stretches with this fold's model.
+
+    `model.isolation_forest.exclude_gap_adjacent_windows` (pass 22
+    diagnostic) applies ONLY to fold_input (what gets SCORED) -- train_input
+    always sees every window, gap-adjacent or not, since the question is
+    whether gap-adjacent windows are being flagged as anomalies, not
+    whether the model should learn from them.
     """
     train_raw, _ = apply_fold(df, fold)
     fold_full = df.loc[(df.index >= fold.train_start) & (df.index <= fold.test_end)]
@@ -402,29 +481,35 @@ def _fit_fold_isolation_forest(
     scalers = fit_regime_scalers(train_raw, train_regimes, settings, fold_id=fold.event_id)
 
     train_input = _build_windowed_input(train_raw, regimes, scalers, settings, stride_mode="train")
-    fold_input = _build_windowed_input(fold_full, regimes, scalers, settings, stride_mode="score")
+    fold_input = _build_windowed_input(
+        fold_full,
+        regimes,
+        scalers,
+        settings,
+        stride_mode="score",
+        exclude_gap_adjacent=settings.model.isolation_forest.exclude_gap_adjacent_windows,
+    )
 
     model = IsolationForestModel(settings)
     model.fit(train_input)
     return model, scalers, train_input, fold_input
 
 
-def _evaluate_pooled_for_fold_windowed(
+def _score_pooled_stretches_windowed(
     df: pd.DataFrame,
     regimes: pd.Series,
     model: IsolationForestModel,
     scalers: dict,
-    threshold: float,
     stretches,
     settings: Settings,
-) -> PooledEvaluation:
-    """Windowed equivalent of _evaluate_pooled_for_fold: scores every pooled
-    normal stretch with this fold's ALREADY-FITTED model and scalers, then
-    pools the false-alarm rate across them (Part B2). A stretch shorter
-    than one window (or empty) yields zero windows -- make_windows()
-    already returns empty tensors for that case, never raises, EXCEPT for a
-    genuinely empty DataFrame, guarded here the same way the rule-based
-    version guards it.
+) -> list[ScoredTestData]:
+    """Score every pooled normal stretch with this fold's ALREADY-FITTED
+    model and scalers -- scoring only, no threshold applied yet, so the
+    result can be evaluated at several thresholds (pooled_at_quantiles)
+    without re-scoring. A stretch shorter than one window (or empty) yields
+    zero windows -- make_windows() already returns empty tensors for that
+    case, never raises, EXCEPT for a genuinely empty DataFrame, guarded
+    here the same way the rule-based version guards it.
 
     Contributions are NEVER computed here: evaluate_pooled_stretches() only
     ever reads test_data.scores/timestamps (episode counting, no ranked
@@ -462,7 +547,53 @@ def _evaluate_pooled_for_fold_windowed(
                 expected_interval=pd.Timedelta(seconds=10),
             )
         )
+    return scored_stretches
+
+
+def _evaluate_pooled_for_fold_windowed(
+    df: pd.DataFrame,
+    regimes: pd.Series,
+    model: IsolationForestModel,
+    scalers: dict,
+    threshold: float,
+    stretches,
+    settings: Settings,
+) -> PooledEvaluation:
+    """Windowed equivalent of _evaluate_pooled_for_fold: pools the
+    false-alarm rate across every pooled normal stretch (Part B2), at a
+    single pre-fitted threshold.
+    """
+    scored_stretches = _score_pooled_stretches_windowed(
+        df, regimes, model, scalers, stretches, settings
+    )
     return evaluate_pooled_stretches(stretches, scored_stretches, threshold, settings)
+
+
+def pooled_at_quantiles(
+    df: pd.DataFrame,
+    regimes: pd.Series,
+    model: IsolationForestModel,
+    scalers: dict,
+    train_scores: np.ndarray,
+    stretches,
+    settings: Settings,
+) -> dict[float, PooledEvaluation]:
+    """Pass 22 (docs/RESULTS.md, event-4 validation Part B): pooled
+    false-alarm rate at EVERY quantile in evaluation.threshold_quantiles,
+    from ONE scoring pass over the pooled stretches -- needed to pick "the
+    tightest quantile whose pooled rate stays under a ceiling" without
+    re-scoring per quantile. Thresholds come from
+    fit_threshold_sweep(train_scores, settings) -- train-scores-only, same
+    discipline as everywhere else.
+    """
+    scored_stretches = _score_pooled_stretches_windowed(
+        df, regimes, model, scalers, stretches, settings
+    )
+    thresholds = fit_threshold_sweep(train_scores, settings)
+    return {
+        q: evaluate_pooled_stretches(stretches, scored_stretches, threshold, settings)
+        for q, threshold in thresholds.items()
+    }
 
 
 def run_pipeline_isolation_forest(settings: Settings) -> dict[int, dict[str, object]]:
@@ -531,3 +662,133 @@ def run_pipeline_isolation_forest(settings: Settings) -> dict[int, dict[str, obj
         }
 
     return results
+
+
+# --- Pass 21: Isolation Forest quantile sweep, checkpointed per fold -------
+#
+# scripts/isolation_forest_experiment.py is a thin CLI/checkpoint wrapper
+# around evaluate_isolation_forest_fold() below: fit once per fold, then
+# sweep evaluation.threshold_quantiles at every evaluation.window_widths
+# entry from that SAME score array (fit_threshold_sweep/evaluate_fold_sweep
+# already do this cheaply -- no re-fitting per quantile). Flagged
+# detections (chance.p_chance_permutation < evaluation.chance_threshold)
+# get IsolationForestModel.explain_episode() called immediately, while the
+# fitted model and fold_input are still in scope -- the checkpoint written
+# by the script holds only the (small) evaluation results, never the model
+# or the windows tensor, so per-fold checkpoints stay cheap to persist.
+
+
+def _evaluate_at_widths_and_quantiles(
+    fold: Fold,
+    event,
+    widths: list[float],
+    model: AnomalyModel,
+    train_input,
+    fold_input,
+    expected_interval: pd.Timedelta,
+    settings: Settings,
+) -> dict[float, dict[float, dict[str, object]]]:
+    """Like _evaluate_at_widths, but sweeps evaluation.threshold_quantiles
+    (evaluate_fold_sweep) at every width too, from ONE shared fit/score
+    pass. Returns {width: {quantile: {"result":, "chance":}}}.
+    """
+    train_scores = model.score(train_input)
+    full_scores = model.score(fold_input)
+    full_contributions = model.contributions(fold_input)
+
+    test_mask = (fold_input.index >= fold.test_start) & (fold_input.index <= fold.test_end)
+    test_data = ScoredTestData(
+        timestamps=fold_input.index[test_mask],
+        scores=full_scores[test_mask],
+        contributions=full_contributions[test_mask],
+        channel_names=model.contributor_names,
+        expected_interval=expected_interval,
+    )
+
+    results: dict[float, dict[float, dict[str, object]]] = {}
+    for width in widths:
+        per_quantile = evaluate_fold_sweep(fold, event, width, train_scores, test_data, settings)
+        results[width] = {
+            q: {"result": result, "chance": evaluate_chance(result, fold, settings)}
+            for q, result in per_quantile.items()
+        }
+    return results
+
+
+def evaluate_isolation_forest_fold(
+    df: pd.DataFrame,
+    regimes: pd.Series,
+    fold: Fold,
+    event,
+    events_sorted,
+    training_exclusion,
+    data_end: pd.Timestamp,
+    stretches,
+    expected_interval: pd.Timedelta,
+    settings: Settings,
+) -> dict[str, object]:
+    """One fold's full Isolation Forest evaluation: fit once, sweep
+    (width, quantile) from that one fit, explain flagged detections
+    immediately (while the model is in scope), then the pooled false-alarm
+    rate. Never returns the fitted model or fold_input -- the caller
+    (scripts/isolation_forest_experiment.py) checkpoints this return value
+    directly, and both of those are too large/heavy to persist per fold.
+
+    "Flagged" = detected AND p_chance_permutation < evaluation.chance_threshold
+    (the same threshold ChanceComparison.not_distinguishable_from_chance
+    itself uses) -- explained per (quantile, episode start, episode end),
+    deduped across widths since episode boundaries depend only on the
+    quantile's threshold, not on window_width_hours (categorise_episode is
+    the only width-dependent step).
+    """
+    extended_fold = extend_test_end_for_false_alarms(
+        fold, event, events_sorted, training_exclusion, data_end
+    )
+    model, scalers, train_input, fold_input = _fit_fold_isolation_forest(
+        df, regimes, extended_fold, settings
+    )
+
+    common_widths = _evaluate_at_widths_and_quantiles(
+        extended_fold,
+        event,
+        settings.evaluation.window_widths,
+        model,
+        train_input,
+        fold_input,
+        expected_interval,
+        settings,
+    )
+
+    chance_threshold = settings.evaluation.chance_threshold
+    explain_cache: dict[tuple, tuple[tuple[str, float], ...]] = {}
+    for width_results in common_widths.values():
+        for quantile, entry in width_results.items():
+            result, chance = entry["result"], entry["chance"]
+            if not (result.detected and chance.p_chance_permutation < chance_threshold):
+                continue
+            explained: dict[tuple[pd.Timestamp, pd.Timestamp], tuple] = {}
+            for ep in result.episodes:
+                if ep.category not in ("early_warning", "concurrent"):
+                    continue
+                cache_key = (quantile, ep.start, ep.end)
+                if cache_key not in explain_cache:
+                    explain_cache[cache_key] = model.explain_episode(ep, fold_input)
+                explained[(ep.start, ep.end)] = explain_cache[cache_key]
+            entry["explained"] = explained
+
+    train_scores = model.score(train_input)
+    threshold = fit_threshold(train_scores, settings)
+    pooled = _evaluate_pooled_for_fold_windowed(
+        df, regimes, model, scalers, threshold, stretches, settings
+    )
+    pooled_by_quantile = pooled_at_quantiles(
+        df, regimes, model, scalers, train_scores, stretches, settings
+    )
+
+    return {
+        "event_id": fold.event_id,
+        "common_widths": common_widths,
+        "extended_test_end": extended_fold.test_end,
+        "pooled": pooled,
+        "pooled_by_quantile": pooled_by_quantile,
+    }

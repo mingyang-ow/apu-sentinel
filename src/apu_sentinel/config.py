@@ -424,7 +424,12 @@ class IsolationForestContributionsConfig(BaseModel):
     model_config = _STRICT
 
     method: Literal["ablation"] = "ablation"
-    enabled: bool = True
+    # Pass 21: defaults OFF -- per-timestamp ablation over a full fold's
+    # sweep (every width x quantile) is what exhausted the CPU. Turn on
+    # only for a final confirmed run; use IsolationForestModel.explain_episode
+    # (models/isolation_forest.py) for the handful of flagged detections
+    # instead of paying the full-fold cost.
+    enabled: bool = False
 
 
 class IsolationForestModelConfig(BaseModel):
@@ -445,6 +450,8 @@ class IsolationForestModelConfig(BaseModel):
     # sklearn accepts "auto", an int, or a float -- passed through as-is.
     max_samples: str | int | float = "auto"
     random_state: int = 42
+    # Passed straight to sklearn's IsolationForest -- -1 uses all cores.
+    n_jobs: int = -1
     # Per-channel window summary stats -- config-listed so the feature set
     # is a documented, swept choice, not hardcoded. Channel order matches
     # data/windows.py make_windows()'s own (analog_columns + passthrough_columns).
@@ -457,6 +464,11 @@ class IsolationForestModelConfig(BaseModel):
     contributions: IsolationForestContributionsConfig = Field(
         default_factory=IsolationForestContributionsConfig
     )
+    # Pass 22 diagnostic: drop scored (never training) windows whose end
+    # timestamp falls within one window_duration of a data gap boundary --
+    # off by default so this stays a deliberate probe, never a silent
+    # change to a real run's results (docs/RESULTS.md pass 22).
+    exclude_gap_adjacent_windows: bool = False
 
 
 class ModelConfig(BaseModel):

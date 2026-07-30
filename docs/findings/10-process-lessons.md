@@ -53,4 +53,22 @@
   specification can be implemented faithfully and still be wrong; a negative
   sweep result is itself evidence to interrogate, not just report, especially
   when the direction of the non-effect is total rather than merely weak.
+- **A 160-combination sweep produced an apparently significant result that
+  required a single pre-chosen operating point to interpret honestly (pass
+  22).** Pass 21's Isolation Forest sweep (4 quantiles × 5 widths × 4 folds ×
+  2 arms) reported event 4 detecting at `p_chance_permutation` as low as
+  0.004 — read naively, a striking result. At α=0.02 over 160 cells, a
+  handful of such hits are expected by chance alone; "the best cell in a
+  large sweep" is a maximum, not a p-value, no different in kind from
+  picking the test-optimal threshold quantile after seeing results (already
+  forbidden by `fit_threshold_sweep`'s own docstring). Selecting ONE
+  operating point by a rule that depends only on false-alarm rate (never on
+  detection outcomes), then reporting the aggregate statistic there,
+  produced a materially different, unremarkable picture (p≈0.37–0.83,
+  matching the rule-based baseline) — even though the underlying event-4
+  signal itself survived independent scrutiny (a gap-artifact check) at the
+  narrower cells where it was strong. Lesson: a model's headline result must
+  be read off a point chosen before the sweep, or by a rule stated and
+  applied independently of the sweep's own outcomes; the single most
+  extreme cell in a wide grid is not that, however small its p-value looks.
 

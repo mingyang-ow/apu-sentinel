@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from apu_sentinel.config import IsolationForestContributionsConfig, IsolationForestModelConfig
 from apu_sentinel.models.base import AnomalyModel
@@ -28,7 +29,10 @@ def _settings(include_cycle_features: bool = False, contributions_enabled: bool 
         contributions=IsolationForestContributionsConfig(enabled=contributions_enabled),
         **kwargs,
     )
-    return SimpleNamespace(model=SimpleNamespace(isolation_forest=cfg))
+    return SimpleNamespace(
+        model=SimpleNamespace(isolation_forest=cfg),
+        evaluation=SimpleNamespace(contribution_aggregation="mean"),
+    )
 
 
 def _windows(n_windows: int, seed: int, loc: float = 0.0, scale: float = 1.0) -> np.ndarray:
@@ -255,3 +259,51 @@ def test_additional_regions_excluded_and_union_merged():
         train.index < pd.Timestamp("2020-01-04 20:00")
     )
     assert not in_region.any()
+
+
+# --- 9. explain_episode: restricted to one episode's own windows -----------
+
+
+def test_explain_episode_ignores_contributions_disabled_and_ranks_planted_feature():
+    settings = _settings(contributions_enabled=False)
+    model = IsolationForestModel(settings)
+    train_windows = _windows(400, seed=8)
+    model.fit(_data(train_windows))
+
+    probe = _windows(30, seed=9)
+    probe[5, :, 1] += 40.0  # channel index 1 ("TP3"), row 5 only
+    data = _data(probe)
+    episode = SimpleNamespace(start=data.end_timestamps[5], end=data.end_timestamps[5])
+
+    ranked = model.explain_episode(episode, data)
+    assert ranked[0][0].startswith("TP3_")
+
+
+def test_explain_episode_restricted_to_episode_window_only():
+    """Only rows whose end_timestamp falls in [episode.start, episode.end]
+    are ablated -- planting an outlier OUTSIDE the episode range must not
+    affect the returned ranking (it never enters the ablation call at all).
+    """
+    settings = _settings()
+    model = IsolationForestModel(settings)
+    train_windows = _windows(400, seed=8)
+    model.fit(_data(train_windows))
+
+    probe = _windows(30, seed=9)
+    probe[20, :, 2] += 40.0  # "Reservoirs", well outside the episode below
+    data = _data(probe)
+    episode = SimpleNamespace(start=data.end_timestamps[0], end=data.end_timestamps[2])
+
+    ranked = model.explain_episode(episode, data)
+    assert not any(name.startswith("Reservoirs_") and value > 1.0 for name, value in ranked)
+
+
+def test_explain_episode_raises_on_no_matching_timestamps():
+    settings = _settings()
+    model = IsolationForestModel(settings)
+    model.fit(_data(_windows(200, seed=8)))
+
+    data = _data(_windows(10, seed=9))
+    episode = SimpleNamespace(start=pd.Timestamp("2019-01-01"), end=pd.Timestamp("2019-01-02"))
+    with pytest.raises(ValueError):
+        model.explain_episode(episode, data)
