@@ -36,6 +36,13 @@ split:
     # (event 1 below has no maintenance entry) -- more conservative since
     # the actual repair/settle time is unknown.
     fallback_post_hours: 48
+    # Pass 21 (docs/RESULTS.md §21): sensitivity-only regions not tied to a
+    # documented failure event -- empty (arm A) is the default; arm B sets
+    # this to exclude the early-March cluster
+    # (`findings/12-event2-error-analysis.md`) as a comparison arm, never a
+    # silent replacement of arm A (excluding it because it improves results
+    # would be data snooping -- see docs/RESULTS.md §21 Part D).
+    additional_regions: []
   # Pass 18 (docs/RESULTS.md §18): guards against pass 13's failure mode --
   # a fold squeezed to near-empty training data fits a threshold of ~0.0
   # and turns its entire test period into one continuous episode.
@@ -342,3 +349,14 @@ model:
       fast_pressure_decay: { enabled: true, source_channel: Reservoirs }
       low_peak_pressure: { enabled: true }
       high_duty_ratio: { enabled: true }
+  # Pass 21: second stage of the model progression (CLAUDE.md). One
+  # IsolationForest per fold, fit on that fold's clean training windows.
+  isolation_forest:
+    n_estimators: 200
+    max_samples: auto
+    random_state: 42
+    window_stats: [mean, std, min, max, slope]
+    include_cycle_features: true
+    contributions:
+      method: ablation
+      enabled: true

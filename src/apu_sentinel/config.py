@@ -43,6 +43,23 @@ class DataConfig(BaseModel):
     subset: float = 1.0
 
 
+class AdditionalExclusionRegion(BaseModel):
+    """One extra training-exclusion region not tied to a documented failure
+    event -- pass 21's March sensitivity arm (docs/RESULTS.md §21): the
+    early-March cluster (`findings/12-event2-error-analysis.md`) is
+    comparably severe to a real precursor but un-anchored to any event, so
+    no event-margin mechanism can ever exclude it (pass 20's standing
+    limitation). Training-only, same as event-derived exclusions -- never
+    affects test periods or detection.
+    """
+
+    model_config = _STRICT
+
+    start: str
+    end: str
+    reason: str | None = None
+
+
 class TrainingExclusionConfig(BaseModel):
     """Fixed, generous margins purging training data around each failure.
 
@@ -58,6 +75,8 @@ class TrainingExclusionConfig(BaseModel):
     # Used instead of post_settle_hours when an event's maintenance
     # timestamp is unrecorded (null) -- see evaluation.failure_events.
     fallback_post_hours: float
+    # Sensitivity-only, empty by default -- see AdditionalExclusionRegion.
+    additional_regions: list[AdditionalExclusionRegion] = Field(default_factory=list)
 
 
 class SplitConfig(BaseModel):
@@ -393,6 +412,53 @@ class RuleBasedModelConfig(BaseModel):
     rules: dict[str, RuleConfig] = Field(default_factory=dict)
 
 
+class IsolationForestContributionsConfig(BaseModel):
+    """Ablation attribution (models/isolation_forest.py): for each feature,
+    re-score with that feature replaced by its training median, and take
+    the score drop as its contribution -- interpretable and model-agnostic,
+    the only per-feature attribution sklearn's IsolationForest doesn't give
+    natively. `enabled: false` returns zeros (and logs) instead of paying
+    the O(n_features) re-scoring cost -- for speed during sweeps.
+    """
+
+    model_config = _STRICT
+
+    method: Literal["ablation"] = "ablation"
+    enabled: bool = True
+
+
+class IsolationForestModelConfig(BaseModel):
+    """models/isolation_forest.py: sklearn.ensemble.IsolationForest wrapped
+    in the AnomalyModel contract, one instance per fold.
+
+    `contamination` is deliberately NOT exposed here: it only shifts
+    sklearn's own `predict()` decision offset, never `score_samples()` (what
+    this model actually calls, negated -- see models/isolation_forest.py),
+    and the harness fits its own threshold from training scores
+    (evaluation/metrics.py fit_threshold). Exposing it would invite
+    "tuning" a knob that provably does nothing here.
+    """
+
+    model_config = _STRICT
+
+    n_estimators: int = 200
+    # sklearn accepts "auto", an int, or a float -- passed through as-is.
+    max_samples: str | int | float = "auto"
+    random_state: int = 42
+    # Per-channel window summary stats -- config-listed so the feature set
+    # is a documented, swept choice, not hardcoded. Channel order matches
+    # data/windows.py make_windows()'s own (analog_columns + passthrough_columns).
+    window_stats: list[str] = Field(default_factory=lambda: ["mean", "std", "min", "max", "slope"])
+    # Whether to append features/cycles.py compute_cycle_features()'s
+    # columns, sampled at each window's end timestamp (the existing
+    # score/label convention) -- same causal features the rule-based model
+    # reads, now available to a windowed model too.
+    include_cycle_features: bool = True
+    contributions: IsolationForestContributionsConfig = Field(
+        default_factory=IsolationForestContributionsConfig
+    )
+
+
 class ModelConfig(BaseModel):
     """Container for the currently-selected model's own config subtree.
 
@@ -405,6 +471,7 @@ class ModelConfig(BaseModel):
     model_config = _STRICT
 
     rule_based: RuleBasedModelConfig | None = None
+    isolation_forest: IsolationForestModelConfig | None = None
 
 
 class Settings(BaseSettings):

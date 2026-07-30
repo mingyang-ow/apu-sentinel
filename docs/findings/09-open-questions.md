@@ -97,7 +97,26 @@
   features).
 
 - **Training-exclusion margin sweep — NEGATIVE, for a verified structural
-  reason (pass 18, `docs/RESULTS.md` §18).** Pass 17 traced event 2's
+  reason (pass 18, `docs/RESULTS.md` §18).**
+
+  > **Correction (pass 20, `docs/RESULTS.md` §20):** the "verified structural
+  > reason" below was itself a bug, not a property of `pre_margin_hours`.
+  > `make_folds()`'s exclusion loop selected regions by event IDENTITY (`if
+  > other.id == event.id: continue`), which is what made a fold's own event
+  > unreachable — not anything inherent to the config parameter. Fixed by
+  > selecting by OVERLAP with the training span instead. Re-running the
+  > identical sweep with the fix: the **ultimate verdict is unchanged** (no
+  > skill gained, `pre_margin_hours` stays at 24h) but for the corrected
+  > reason — a *second*, independent, un-anchored contamination source (the
+  > early-March cluster) sits at comparably extreme values and takes over the
+  > calibration floor the moment the actually-reachable contamination (event
+  > 2's own precursor) is removed. The "open follow-up" at the end of this
+  > bullet (excluding an event's own precursor from its own fold) is answered:
+  > done, verified structurally correct, and still not sufficient on its own.
+  > This bullet's own body below is kept unedited as the historical record of
+  > what pass 18 believed and why it was wrong — not deleted.
+
+  Pass 17 traced event 2's
   non-detection to fold 2's own calibration being contaminated by its own
   mid-May collapse, sitting inside fold 2's own training window because
   `training_exclusion.pre_margin_hours` (24h) purges only 24h before onset —
@@ -162,18 +181,24 @@
   verified fact, not an assumption carried forward unchecked.
 
 - **Standing limitation on training purity — applies to every subsequent
-  model (pass 18, Part E).** No sweep of `pre_margin_hours`, however wide,
-  fully restores training purity, for two independent, now both-verified
-  reasons: (1) degraded-looking operation recurs OUTSIDE every documented
-  failure event — the early-March cluster
+  model (pass 18 Part E; corrected pass 20).** Pass 18 recorded TWO reasons
+  no sweep of `pre_margin_hours` restores training purity. **Pass 20 fixed
+  one of them**: (2) below ("a fold's OWN event's precursor is structurally
+  un-excludable") was a `make_folds()` bug (event-identity exclusion
+  selection), not a structural property — fixed by selecting exclusions by
+  overlap with the training span instead, verified directly
+  (`tests/test_split_no_leakage.py`). Reason (1) remains and is now the
+  ENTIRE standing limitation: degraded-looking operation recurs OUTSIDE
+  every documented failure event — the early-March cluster
   (`findings/12-event2-error-analysis.md`) is comparably severe to mid-May
   with no documented failure, and no failure-event-anchored exclusion
-  mechanism can ever reach it, since it isn't anchored to any event at all;
-  and (2), newly shown by pass 18, a fold's OWN event's precursor is
-  structurally un-excludable from its OWN training by this mechanism
-  regardless of configuration. Isolation Forest and the autoencoder
-  (CLAUDE.md's next model-progression stages), trained on these same
-  per-fold slices, inherit BOTH limitations identically — this is a property
-  of the walk-forward split construction, not of the rule-based model being
-  evaluated against it.
+  mechanism can ever reach it, since it isn't anchored to any event at all.
+  Directly measured (pass 20, `docs/RESULTS.md` §20): even with (2) fixed
+  and both event 1's and event 2's own precursors excluded from fold 2's
+  training, 74.6% of its calibration's bottom-5% tail is still March data.
+  Isolation Forest and the autoencoder (CLAUDE.md's next model-progression
+  stages), trained on these same per-fold slices, inherit this one remaining
+  limitation identically — a property of the walk-forward split
+  construction and the absence of an undocumented-anomaly label, not of the
+  rule-based model being evaluated against it.
 

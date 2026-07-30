@@ -159,23 +159,31 @@ def test_overlapping_exclusions_merge_into_one_region(
     synthetic_split_df_wide,
 ):
     """Event 1's and event 2's own exclusion windows overlap each other
-    (see the fixture's docstring) -- event 3's fold, which purges both from
-    its training data, must see them merged into a SINGLE disjoint region,
-    not two overlapping tuples, and no training timestamp may fall inside
-    the merged span.
+    (see the fixture's docstring) -- event 3's fold must see them merged
+    into a SINGLE disjoint region, not two overlapping tuples, and no
+    training timestamp may fall inside it. Pass 20: exclusions are
+    selected by overlap with the training span, not by event identity, so
+    fold 3 ALSO excludes its own event's precursor (clipped to train_end)
+    as a second, separate region -- two disjoint exclusions in total, not
+    one.
     """
     data_start, data_end = synthetic_split_data_bounds_wide
     folds = make_folds(synthetic_split_settings_overlapping_exclusions, data_start, data_end)
     fold3 = next(f for f in folds if f.event_id == 3)
 
-    assert len(fold3.train_exclusions) == 1
+    assert len(fold3.train_exclusions) == 2
     merged_start, merged_end = fold3.train_exclusions[0]
     assert merged_start == pd.Timestamp("2020-01-03 18:00")
     assert merged_end == pd.Timestamp("2020-01-14 10:00")
 
+    own_precursor_start, own_precursor_end = fold3.train_exclusions[1]
+    assert own_precursor_start == pd.Timestamp("2020-02-28 18:00")
+    assert own_precursor_end == fold3.train_end
+
     train, _test = apply_fold(synthetic_split_df_wide, fold3)
-    in_excluded_region = (train.index >= merged_start) & (train.index < merged_end)
-    assert not in_excluded_region.any()
+    for excl_start, excl_end in fold3.train_exclusions:
+        in_excluded_region = (train.index >= excl_start) & (train.index < excl_end)
+        assert not in_excluded_region.any()
 
 
 def test_wider_margin_excludes_strictly_more_and_specific_timestamps(
@@ -316,3 +324,142 @@ def test_extend_test_end_never_moves_before_folds_own_test_end(
     )
     assert extended.test_end >= fold2.test_end
     assert extended.test_end >= extended.test_start
+
+
+# --- Pass 20: exclusion selection by overlap, not event position -----------
+
+
+def test_own_event_precursor_excluded_from_own_training(
+    synthetic_split_events,
+    synthetic_training_exclusion,
+    synthetic_split_data_bounds,
+    synthetic_split_df,
+):
+    """The bug pass 20 fixes: a fold's own target event starts AFTER its
+    own train_end, so under the old event-identity selection its own
+    precursor was never excluded, at any pre_margin_hours. A wide enough
+    margin must now reach into the fold's own training span and remove it.
+    """
+    data_start, data_end = synthetic_split_data_bounds
+    training_exclusion = synthetic_training_exclusion.model_copy(update={"pre_margin_hours": 100})
+    settings = SimpleNamespace(
+        split=SplitConfig(embargo_hours=4, training_exclusion=training_exclusion),
+        evaluation=EvaluationConfig(
+            window_widths=[6, 12, 24, 48], failure_events=synthetic_split_events
+        ),
+    )
+
+    folds = make_folds(settings, data_start, data_end)
+    fold2 = next(f for f in folds if f.event_id == 2)
+    event2 = next(e for e in synthetic_split_events if e.id == 2)
+
+    own_precursor_start = pd.Timestamp(event2.start) - pd.Timedelta(hours=100)
+    assert own_precursor_start < fold2.train_end  # the region genuinely reaches into training
+
+    train, _test = apply_fold(synthetic_split_df, fold2)
+    in_own_precursor = (train.index >= own_precursor_start) & (train.index < fold2.train_end)
+    assert not in_own_precursor.any()
+
+
+def test_overlap_selection_clips_region_straddling_train_end(
+    synthetic_split_events, synthetic_training_exclusion, synthetic_split_data_bounds
+):
+    """An exclusion region that straddles train_end (starts inside the
+    training span, ends well after it -- here, inside event 2's own test
+    period) is applied only to the portion inside the training span, not
+    the region's full un-clipped extent.
+    """
+    data_start, data_end = synthetic_split_data_bounds
+    training_exclusion = synthetic_training_exclusion.model_copy(update={"pre_margin_hours": 100})
+    settings = SimpleNamespace(
+        split=SplitConfig(embargo_hours=4, training_exclusion=training_exclusion),
+        evaluation=EvaluationConfig(
+            window_widths=[6, 12, 24, 48], failure_events=synthetic_split_events
+        ),
+    )
+
+    folds = make_folds(settings, data_start, data_end)
+    fold2 = next(f for f in folds if f.event_id == 2)
+    event2 = next(e for e in synthetic_split_events if e.id == 2)
+
+    own_precursor_start = pd.Timestamp(event2.start) - pd.Timedelta(hours=100)
+    unclipped_end = pd.Timestamp(event2.maintenance) + pd.Timedelta(
+        hours=training_exclusion.post_settle_hours
+    )
+    assert unclipped_end > fold2.train_end  # confirms the region genuinely straddles train_end
+
+    matching = [(s, e) for s, e in fold2.train_exclusions if s == own_precursor_start]
+    assert len(matching) == 1
+    _, clipped_end = matching[0]
+    assert clipped_end == fold2.train_end
+    assert clipped_end < unclipped_end
+
+
+def test_fold1_gains_own_exclusion_at_wide_enough_margin(
+    synthetic_split_events, synthetic_training_exclusion, synthetic_split_data_bounds
+):
+    """Fold 1 (earliest event, no earlier event to exclude) had ZERO
+    exclusions at every margin under the old event-identity selection
+    (pass 18's finding). A margin wide enough to reach back before its own
+    train_end must now give it its own event's exclusion.
+    """
+    data_start, data_end = synthetic_split_data_bounds
+    evaluation = EvaluationConfig(
+        window_widths=[6, 12, 24, 48], failure_events=synthetic_split_events
+    )
+    event1 = next(e for e in synthetic_split_events if e.id == 1)
+
+    narrow_settings = SimpleNamespace(
+        split=SplitConfig(embargo_hours=4, training_exclusion=synthetic_training_exclusion),
+        evaluation=evaluation,
+    )
+    fold1_narrow = next(
+        f for f in make_folds(narrow_settings, data_start, data_end) if f.event_id == 1
+    )
+    assert fold1_narrow.train_exclusions == ()
+
+    wide_training_exclusion = synthetic_training_exclusion.model_copy(
+        update={"pre_margin_hours": 60}
+    )
+    wide_settings = SimpleNamespace(
+        split=SplitConfig(embargo_hours=4, training_exclusion=wide_training_exclusion),
+        evaluation=evaluation,
+    )
+    fold1_wide = next(f for f in make_folds(wide_settings, data_start, data_end) if f.event_id == 1)
+
+    assert len(fold1_wide.train_exclusions) == 1
+    excl_start, excl_end = fold1_wide.train_exclusions[0]
+    assert excl_start == pd.Timestamp(event1.start) - pd.Timedelta(hours=60)
+    assert excl_end == fold1_wide.train_end
+
+
+def test_causality_and_embargo_hold_with_own_event_exclusions(
+    synthetic_split_events,
+    synthetic_training_exclusion,
+    synthetic_split_data_bounds,
+    synthetic_split_df,
+):
+    """Same causality/embargo invariants as the existing checks above, now
+    exercised with own-event self-exclusion active (a wide margin) -- the
+    overlap-based selection must not weaken either guarantee.
+    """
+    data_start, data_end = synthetic_split_data_bounds
+    training_exclusion = synthetic_training_exclusion.model_copy(update={"pre_margin_hours": 100})
+    settings = SimpleNamespace(
+        split=SplitConfig(embargo_hours=4, training_exclusion=training_exclusion),
+        evaluation=EvaluationConfig(
+            window_widths=[6, 12, 24, 48], failure_events=synthetic_split_events
+        ),
+    )
+
+    embargo = pd.Timedelta(hours=4)
+    folds = make_folds(settings, data_start, data_end)
+    for fold in folds:
+        assert fold.train_end < fold.test_start
+        assert fold.test_start - fold.train_end >= embargo
+
+        train, _test = apply_fold(synthetic_split_df, fold)
+        assert (train.index < fold.test_start).all()
+        for excl_start, excl_end in fold.train_exclusions:
+            assert excl_start < excl_end
+            assert excl_end <= fold.train_end

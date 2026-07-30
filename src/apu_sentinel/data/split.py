@@ -14,8 +14,10 @@ For fold k, targeting event k:
 - test period = [event.start - max(window_widths) - embargo, test_end],
   where test_end extends to event.maintenance if that is later than
   event.end (and recorded).
-- train period = [data_start, test_start - embargo), with all earlier
-  events' training-exclusion regions removed.
+- train period = [data_start, test_start - embargo), with every documented
+  event's training-exclusion region that OVERLAPS this span removed --
+  selected by overlap, not by whether the event is chronologically earlier
+  or later than the fold's own target event (pass 20, see below).
 
 Embargo rationale: once sliding windows are built (a later pass), a window
 starting just before a boundary would span it, letting a training sample
@@ -27,7 +29,9 @@ yet.
 Training-exclusion vs. window_widths: these are two DELIBERATELY separate
 concepts. training_exclusion.* (config) is a fixed, generous margin that
 protects training purity by removing ramp-up-to-failure and post-repair
-data from every earlier event. evaluation.window_widths is the SWEPT
+data from every event whose exclusion region overlaps the training span --
+including the fold's OWN target event (pass 20, see below); "earlier" vs.
+"later" is not the criterion. evaluation.window_widths is the SWEPT
 pre-failure label width used at evaluation/labelling time. Neither is
 derived from the other.
 
@@ -77,11 +81,32 @@ threshold of ~0.0 and turns its entire test period into one continuous
 episode. `make_folds()` raises, naming the offending fold and its actual
 remaining days, rather than letting that recur silently.
 
+Pass 20 (docs/RESULTS.md §20, docs/findings/10-process-lessons.md): the
+exclusion loop previously skipped `other.id == event.id` -- i.e. selected
+by event IDENTITY, excluding every OTHER documented event's region but
+never the fold's own target event's. A fold's own event starts AFTER its
+own train_end, so its precursor was never excluded from its own training,
+at any `pre_margin_hours` value -- the exact bug pass 18's flat margin
+sweep traced back to. Fixed by selecting by OVERLAP with the training span
+instead: every event's exclusion window is built and kept if it
+intersects [data_start, train_end), regardless of identity or
+chronological order. Safe by construction (removing training data cannot
+introduce leakage); the pass-18 union-merge above is unchanged and still
+applies to whatever set of regions this selection produces.
+
+Pass 21 (docs/RESULTS.md §21): `training_exclusion.additional_regions`
+adds sensitivity-only exclusion regions not tied to any documented event
+(e.g. the un-anchored early-March cluster pass 20 identified) -- selected
+and clipped by the same overlap-with-training-span logic as event regions
+above, then union-merged alongside them. Training only, exactly like every
+other exclusion here; never affects test periods.
+
 Public API:
 - `Fold` -- one fold's boundaries: train_start/train_end, test_start/
   test_end, train_exclusions (tuple of DISJOINT (start, end) regions to
-  drop from training -- overlapping source regions already merged, pass
-  18). Produced by make_folds(); consumed by apply_fold() and every
+  drop from training -- selected by overlap with the training span, pass
+  20, including the fold's own event; overlapping source regions merged,
+  pass 18). Produced by make_folds(); consumed by apply_fold() and every
   evaluation/ function that needs test_start/test_end.
 - `training_days_remaining(fold) -> float` -- wall-clock days of training
   time left after `fold.train_exclusions` are removed from
@@ -366,12 +391,16 @@ def make_folds(
 
         exclusions = []
         for other in events_sorted:
-            if other.id == event.id:
-                continue
             excl_start, excl_end = _exclusion_window(other, training_exclusion)
             if excl_end <= data_start or excl_start >= train_end:
                 continue
             exclusions.append((max(excl_start, data_start), min(excl_end, train_end)))
+
+        for region in training_exclusion.additional_regions:
+            region_start, region_end = pd.Timestamp(region.start), pd.Timestamp(region.end)
+            if region_end <= data_start or region_start >= train_end:
+                continue
+            exclusions.append((max(region_start, data_start), min(region_end, train_end)))
 
         fold = Fold(
             event_id=event.id,

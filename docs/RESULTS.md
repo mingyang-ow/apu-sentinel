@@ -10,276 +10,193 @@ the record, the same principle as the April-gap correction in
 ## Contents
 
 **Current**
-- [18. Training-exclusion margin sweep — the sweep cannot fix what pass 17 found (pass 18)](#18-training-exclusion-margin-sweep--the-sweep-cannot-fix-what-pass-17-found-pass-18)
+- [20. Exclusion-selection fix (overlap-based) — the lever now reaches, and it still isn't enough (pass 20)](#20-exclusion-selection-fix-overlap-based--the-lever-now-reaches-and-it-still-isnt-enough-pass-20)
 - [17. Lagged baseline — fixes the mechanism, does not change the verdict (pass 17)](#17-lagged-baseline--fixes-the-mechanism-does-not-change-the-verdict-pass-17)
 - [15. Threshold sweep diagnostic (pass 15)](#15-threshold-sweep-diagnostic-pass-15)
 - [13. Null comparison and honest false-alarm estimation (pass 13)](#13-null-comparison-and-honest-false-alarm-estimation-pass-13)
 
 **Superseded**
+- [18. Training-exclusion margin sweep — the sweep cannot fix what pass 17 found (pass 18)](#18-training-exclusion-margin-sweep--the-sweep-cannot-fix-what-pass-17-found-pass-18)
 - [12. Baseline results (pass 12) — first model scored end-to-end](#12-baseline-results-pass-12--first-model-scored-end-to-end)
 
 ---
 
 ## Current results
 
-### 18. Training-exclusion margin sweep — the sweep cannot fix what pass 17 found (pass 18)
+### 20. Exclusion-selection fix (overlap-based) — the lever now reaches, and it still isn't enough (pass 20)
 
-Pass 17 traced event 2's non-detection to calibration contamination: fold 2's
-training window (2020-02-01 → 2020-05-24 23:30) includes the entire mid-May
-collapse as "normal" data, because `training_exclusion.pre_margin_hours` (24h)
-purges only 24h before onset — far short of the ~12-day precursor. This
-section sweeps `pre_margin_hours` over `[24h (reference), 7d, 14d, 21d]` under
-`baseline_mode: lagged` across all four folds, on the real dataset
-(`CONFIG=local`; `data.subset` not applied, per `pipeline.py`'s own
-docstring — full Feb–Aug span needed for walk-forward folds).
+**Correction to §18 below**: §18 concluded `training_exclusion.pre_margin_hours`
+"was never the right lever" for event 2's calibration contamination. That
+conclusion was wrong, for a bug now fixed. `make_folds()`'s exclusion loop
+selected regions by event IDENTITY (`if other.id == event.id: continue`) —
+excluding every OTHER documented event's precursor from a fold's training,
+but never the fold's OWN target event's, at any margin. Since a fold's own
+event necessarily starts after that fold's own `train_end`, the parameter
+was reaching for data it could never touch — §18's flat sweep was a direct,
+deterministic consequence of this bug, not evidence about the parameter
+itself. It **was** the right lever; it was pointed at unreachable data.
 
-**Headline finding, verified directly against the code before being recorded
-(`findings/10-process-lessons.md` discipline): widening `pre_margin_hours`
-cannot fix fold 2's contamination, at any margin, because it was never the
-right lever.** `data/split.py`'s `make_folds()` builds a fold's
-`train_exclusions` only from **other** events (`if other.id == event.id:
-continue`) — a fold never excludes its own event's precursor from its own
-training. Fold 2's mid-May collapse is event 2's **own** precursor, sitting in
-event 2's **own** fold — structurally un-excludable by
-`training_exclusion.pre_margin_hours` regardless of its value, because that
-setting only ever protects a **later** fold from an **earlier** event's
-ramp-up, not an event from itself. This is confirmed directly: fold 1 (the
-earliest event, with no earlier event to exclude at all) shows **byte-identical**
-calibration and detection numbers at every margin tested — its own remaining
-training days (72.00) and `short_stopped_duration` calibration 5th percentile
-(0.1223, lagged) never move, because nothing in this sweep ever touches its
-training slice.
+Fixed by selecting exclusion regions by **overlap with the training span**
+instead of by event identity or chronological position: every documented
+event's exclusion window is built and kept if it intersects
+`[data_start, train_end)`, full stop. Verified directly (not assumed): fold 2
+now carries its own event's precursor as an exclusion once the margin is
+wide enough to reach it, and fold 1 (which had **zero** exclusions at every
+margin in §18, since it has no earlier event) now gains its own event's
+margin too.
 
-#### Part A — Remaining training days per fold, per margin
+Re-running §18's sweep with the fix — same grid
+(`pre_margin_hours ∈ {24h, 7d, 14d, 21d}`, `baseline_mode: lagged`, all four
+folds, common widths) plus the full threshold-quantile sweep
+(`{0.995, 0.999, 0.9995, 0.9999}`) — the **verdict is unchanged (no skill
+gained), but the reason is now different and more precise**: the fix is
+confirmed working correctly, and it still isn't enough, because a *second*,
+independent, un-anchored contamination source already flagged in §18 Part E
+(the early-March cluster) sits at comparably extreme values and continues to
+set the calibration's floor even after the actually-reachable contamination
+(event 2's own precursor) is removed.
+
+#### The fix, verified structurally
+
+| margin | event 2 exclusion regions (fold 2) |
+|---|---|
+| 24h | `(2020-03-28 00:00, 2020-04-20 23:59)` — event 1's precursor+settle only. 1 region. |
+| 21d | `(2020-03-28 00:00, 2020-04-20 23:59)`, `(2020-05-08 23:30, 2020-05-24 23:30)` — event 1's, **and now event 2's own precursor**, clipped to `train_end`. 2 regions. |
+
+Fold 1 (event 1, earliest — no earlier event exists): 0 exclusions at every
+margin in §18; now gains `(event1.start − margin, train_end)` once the margin
+exceeds ~32h (its own train_end sits that close to its own onset).
+
+#### Calibration 5th percentile (`short_stopped_duration`, lagged mode) — does fold 2's rise?
 
 | margin | event 1 | event 2 | event 3 | event 4 |
 |---|---|---|---|---|
-| 24h (reference/lagged) | 72.00 / 72.00 (100.0%) | 109.98 / 113.98 (96.5%) | 113.98 / 120.42 (94.7%) | 148.83 / 160.60 (92.7%) |
-| 7d | 72.00 / 72.00 (100.0%) | 103.98 / 113.98 (91.2%) | 101.98 / 120.42 (84.7%) | 132.92 / 160.60 (82.8%) |
-| 14d | 72.00 / 72.00 (100.0%) | 94.42 / 113.98 (82.8%) | 87.98 / 120.42 (73.1%) | 118.92 / 160.60 (74.0%) |
-| 21d | 72.00 / 72.00 (100.0%) | 80.42 / 113.98 (70.6%) | 73.98 / 120.42 (61.4%) | 104.92 / 160.60 (65.3%) |
+| 24h | 0.1223 | 0.1514 | 0.1496 | 0.1771 |
+| 7d | 0.1206 | 0.1371 | 0.1371 | 0.1783 |
+| 14d | 0.1062 | 0.1408 | 0.1408 | 0.1292 |
+| 21d | 0.0889 | 0.1215 | 0.1215 | 0.1337 |
 
-Training shrinks materially and monotonically as the margin widens — at 21d,
-event 3 loses nearly 39% of its training span, close to the brief's
-"roughly a quarter of fold 4" estimate (fold 4 loses 34.7% — same order).
-Event 1 is flat by construction (see above). Every value stays comfortably
-above `split.min_training_days` (30 days, adopted below) — no fold in this
-sweep collapses toward pass 13's near-empty-training failure mode, though the
-trend shows it is not an implausible future concern at even wider margins.
+**No — not meaningfully, and not monotonically.** Event 2's window-open
+lagged ratio is 0.274 (§17); its calibration 5th percentile needs to rise
+*above* that to matter. It moves 0.1514 → 0.1371 → 0.1408 → 0.1215 as the
+margin widens — noise around ~0.12–0.15, not a climb toward 0.274. Event 1
+(which has NO documented precursor per `findings/08-cycle-timing.md` —
+"absent for events 1 & 3") **falls** as its margin widens (0.1223 → 0.0889):
+widening removes mostly ordinary pre-onset operation there, not
+contamination, so the effect is sampling noise from a shrinking training set,
+not purification. This is a real, asymmetric cost of one global
+`pre_margin_hours` value applied uniformly to events with and without a
+known precursor.
 
-#### Part A — Calibration 5th percentile (`short_stopped_duration`, the rule pass 17 implicated)
+**Verified directly why fold 2's own number doesn't move**: re-computing the
+lagged `short_stopped_duration` ratio over fold 2's ACTUAL (fixed,
+exclusion-purged) training slice at the widest margin (21d, which excludes
+both event 1's precursor AND event 2's own precursor) —
 
-| margin/mode | event 1 | event 2 | event 3 | event 4 |
-|---|---|---|---|---|
-| trailing@24h (reference) | 0.2384 | 0.2146 | 0.2183 | 0.2453 |
-| lagged@24h | 0.1223 | 0.1514 | 0.1496 | 0.1771 |
-| lagged@7d | 0.1223 | 0.1408 | 0.1371 | 0.1794 |
-| lagged@14d | 0.1223 | 0.1362 | 0.1408 | 0.1324 |
-| lagged@21d | 0.1223 | 0.1319 | 0.1215 | 0.1447 |
+- 5th percentile of the cleaned calibration: **0.1215**.
+- The bottom-5% tail (18,738 samples) is dominated by **March**: 13,988 of
+  them (74.6%) fall in 2020-03, versus only 1,523 in May (the event 2
+  precursor that was just newly excluded) and 1,486 in April.
+- March 1–15 alone: min ratio 0.0, median 0.457, and 13,478 of its 107,153
+  samples already sit at or below the fold's 5th percentile.
 
-Event 2's window-open ratio (lagged mode, pass 17) is **0.274**. For
-detection, fold 2's calibration 5th percentile needs to rise **above** 0.274
-so that ratio reads as a high severity rather than "unremarkably low, 5th
-percentile or worse." It never does — and it does not even move in the
-helpful direction: 0.1514 → 0.1408 → 0.1362 → 0.1319 **falls** as the margin
-widens, because widening only removes more of event 1's era (Feb–March) from
-fold 2's training (an unrelated, earlier event), concentrating the *remaining*
-training distribution more heavily around whatever low values (May's own
-collapse, and the March cluster — neither excludable by this lever) are
-already in it. Event 1's own 0.1223 is exactly flat across every margin,
-direct confirmation of the mechanism above.
+The early-March cluster (`findings/12-event2-error-analysis.md`,
+`findings/09-open-questions.md` Part E) is not anchored to any documented
+failure event, so no value of `pre_margin_hours` — however correctly the
+selection logic now works — can ever exclude it. It was already sitting at
+comparably extreme values before this fix, and once event 2's own precursor
+is finally removed, March simply takes over as the new floor. This is the
+standing limitation §18 Part E already recorded, now directly measured
+rather than inferred.
 
-#### Part A/C — Detection, lead time, false-alarm rates (width=72h, the primary common width)
-
-| event | margin | detected | lead time | fa/day (infold) | eval_days (infold) | fa/day (pooled) | p_poisson | p_perm | flagged |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | trailing@24h | **yes** | 2d22h57m | 0.683 | 32.22 | 0.504 | 0.871 | 0.781 | yes |
-| 1 | lagged@24h | **yes** | 2d22h57m | 0.404 | 32.22 | 0.305 | 0.702 | 0.708 | yes |
-| 1 | lagged@7d | **yes** | 2d22h57m | 0.431 | 27.84 | 0.305 | 0.726 | 0.696 | yes |
-| 1 | lagged@14d | **yes** | 2d22h57m | 0.362 | 22.08 | 0.305 | 0.663 | 0.625 | yes |
-| 1 | lagged@21d | **yes** | 2d22h57m | 0.361 | 16.63 | 0.305 | 0.661 | 0.680 | yes |
-| 2 | trailing@24h | no | — | 0.285 | 7.01 | 0.385 | 0.575 | 0.381 | — |
-| 2 | lagged@24h | no | — | 0.285 | 7.01 | 0.278 | 0.575 | 0.381 | — |
-| 2 | lagged@7d | no | — | 0.277 | 3.61 | 0.305 | 0.564 | 0.185 | — |
-| 2 | lagged@14d | no | — | 0.277 | 3.61 | 0.292 | 0.564 | 0.185 | — |
-| 2 | lagged@21d | no | — | 0.277 | 3.61 | 0.338 | 0.564 | 0.185 | — |
-| 3 | trailing@24h | no | — | 0.426 | 32.83 | 0.371 | 0.722 | 0.503 | — |
-| 3 | lagged@24h | no | — | 0.548 | 32.83 | 0.278 | 0.807 | 0.548 | — |
-| 3 | lagged@7d | no | — | 0.276 | 29.03 | 0.298 | 0.562 | 0.444 | — |
-| 3 | lagged@14d | no | — | 0.310 | 22.58 | 0.298 | 0.606 | 0.540 | — |
-| 3 | lagged@21d | no | — | 0.350 | 17.16 | 0.331 | 0.650 | 0.524 | — |
-| 4 | trailing@24h | **yes** | 0d17h01m | 0.242 | 41.25 | 0.358 | 0.517 | 0.440 | yes |
-| 4 | lagged@24h | **yes** | 0d17h01m | 0.242 | 41.25 | 0.239 | 0.517 | 0.440 | yes |
-| 4 | lagged@7d | **yes** | 1d16h51m | 0.315 | 41.25 | 0.259 | 0.611 | 0.553 | yes |
-| 4 | lagged@14d | **yes** | 1d16h51m | 0.315 | 41.25 | 0.245 | 0.611 | 0.553 | yes |
-| 4 | lagged@21d | **yes** | 0d17h01m | 0.242 | 41.25 | 0.232 | 0.517 | 0.440 | yes |
-
-Event 2 remains undetected at **every** margin tested — the aggregate
-statistic below is the headline, but this row-by-row view already shows there
-is no margin at which fold 2 crosses its own threshold. Event 4's lead time
-shifts between the original 0d17h01m and 1d16h51m at 7d/14d margins (a
-*different* episode becomes the earliest `early_warning` one as fold 4's own
-calibration shifts with its own training exclusions) then reverts at 21d —
-noted as a real, non-monotonic side effect of recalibration, not a
-progression toward a longer lead time.
-
-Event 2's evaluated_days (infold) **drops from 7.01 to 3.61** at 7d+ margins.
-This is a second, distinct consequence of widening surfaced by this sweep
-(Part B below): `extend_test_end_for_false_alarms` (pass 13) pushes a fold's
-false-alarm-counting test_end out to just before the *next* event's exclusion
-window begins — but at a 7d+ margin, event 3's exclusion window now starts
-*before* event 2's own un-extended test_end, so no extension is possible and
-the false-alarm denominator collapses back to its tight, ~3.6-day original
-span. Reported here as a real cost of widening, not folded into "no effect."
-
-#### Aggregate skill statistic — the headline comparison
+#### Aggregate skill statistic — the headline comparison, full quantile sweep
 
 `expected = Σ p_chance_permutation`; `observed` = detection count (of 4
 folds); `p(X≥observed)` is the exact Poisson-binomial survival probability.
 
-| quantile 0.995 | width | trailing@24h | lagged@24h | lagged@7d | lagged@14d | lagged@21d |
+| quantile | width | trailing@24h | lagged@24h | lagged@7d | lagged@14d | lagged@21d |
 |---|---|---|---|---|---|---|
-| obs/exp/p | 24h | 2 / 1.032 / 0.271 | 2 / 1.026 / 0.270 | 2 / 0.935 / 0.228 | 2 / 0.903 / 0.217 | 2 / 0.914 / 0.218 |
-| obs/exp/p | 48h | 2 / 1.650 / 0.549 | 2 / 1.646 / 0.547 | 2 / 1.446 / 0.462 | 2 / 1.414 / 0.448 | 2 / 1.374 / 0.427 |
-| obs/exp/p | 72h | 2 / 2.106 / 0.737 | 2 / 2.078 / 0.724 | 2 / 1.878 / 0.658 | 2 / 1.902 / 0.666 | 2 / 1.829 / 0.636 |
-| obs/exp/p | 6h/12h | 0 / (falls with quantile) / 1.000 | same | same | same | same |
+| 0.995 | 24h | 2/1.032/0.271 | 2/1.026/0.270 | 2/0.967/0.242 | 2/0.971/0.245 | 2/1.010/0.261 |
+| 0.995 | 48h | 2/1.650/0.549 | 2/1.646/0.547 | 2/1.479/0.479 | 2/1.481/0.480 | 2/1.506/0.492 |
+| 0.995 | 72h | 2/2.106/0.737 | 2/2.078/0.724 | 2/1.910/0.673 | 2/1.972/0.697 | 2/1.973/0.698 |
+| 0.999 | any | 0/…/1.000 | 0/…/1.000 | 0/…/1.000 | 0/…/1.000 | 0/…/1.000 |
+| 0.9995 | any | 0/…/1.000 | 0/…/1.000 | 0/…/1.000 | 0/…/1.000 | 0/…/1.000 |
+| 0.9999 | any | 0/…/1.000 | 0/…/1.000 | 0/…/1.000 | 0/…/1.000 | 0/…/1.000 |
 
-The p-value drifts modestly downward as the margin widens (e.g. 72h: 0.737 →
-0.724 → 0.658 → 0.666 → 0.636) — but **this drift is not driven by event 2**
-(still undetected everywhere, contributing nothing to `observed`); it comes
-entirely from events 1 and 3's own false-alarm rates tightening slightly as
-their own earlier-event exclusions widen, lowering their individual
-`p_chance_permutation` inputs to the sum. Observed stays at 2 of 4 across
-every margin tested. **This is not the improvement the brief's first
-anticipated outcome describes** ("detects more, and the aggregate p-value
-falls" because of *event 2*) — it is a small, unrelated, second-order effect
-on the *other* two detecting folds' own calibration. Per the brief's explicit
-requirement: increased margin does **not** buy skill on event 2 at any width
-or margin tested.
+**Essentially flat across every margin and every quantile tested.** At the
+primary operating point (q=0.995, 72h) the p-value stays in a narrow
+0.67–0.74 band with no trend attributable to the fix; at every tighter
+quantile (0.999+), observed detections collapse to 0 regardless of margin —
+exactly pass 15's "no ranking signal" finding, now shown to hold with the
+exclusion bug fixed too. `observed` never exceeds 2 (events 1 and 4, the
+same two as every prior pass) at any (margin, quantile, width) combination —
+**events 2 and 3 are undetected everywhere in this sweep**, confirmed
+explicitly, not inferred from the aggregate alone.
 
-#### Part B — Exclusion-region overlap, the union fix, and a second bug it surfaced
+#### Event 2: undetected at every margin and every quantile
 
-At wide margins, exclusion regions from adjacent events overlap (e.g. events
-1/2's own windows would overlap each other were they close enough in time,
-matching the brief's own worked example for events 2/3 at a 14d margin).
-`make_folds()` now takes the union of overlapping exclusion regions before
-storing them on a `Fold` (`_merge_exclusion_windows`), so `train_exclusions`
-is always disjoint — verified directly (`test_overlapping_exclusions_merge_into_one_region`)
-and exercised on real event geometry via `event_max_width_hours`'s own
-pre_margin-invariance below.
+| margin | width=72h detected | lead time | p_poisson | p_perm |
+|---|---|---|---|---|
+| trailing@24h | no | — | 0.575 | 0.381 |
+| lagged@24h | no | — | 0.575 | 0.381 |
+| lagged@7d | no | — | 0.564 | 0.185 |
+| lagged@14d | no | — | 0.564 | 0.185 |
+| lagged@21d | no | — | 0.564 | 0.185 |
 
-**A second, distinct bug surfaced by actually running the sweep, not by
-inspection alone**: `extend_test_end_for_false_alarms` (pass 13) assumed the
-*next* event's exclusion window always starts safely after the *current*
-fold's own test period. At `lagged@14d`, event 3's exclusion window now
-starts 2020-05-22 10:00 — **before** event 2's own `test_start`
-(2020-05-25 23:30) — because event 3 and event 2 are only ~6 days apart and
-14 days now reaches back past event 2's own onset entirely. Unclamped, this
-silently produced `test_end < test_start`, which crashed
-`p_chance_permutation` downstream with an opaque "no candidate placement
-fits" error rather than surfacing the real problem. Fixed by clamping the
-extension to never move `test_end` before the fold's own (un-extended)
-`test_end` — if the next event's exclusion has already swallowed the entire
-would-be extension, no extra false-alarm-counting time is available, full
-stop. Covered by `test_extend_test_end_never_moves_before_folds_own_test_end`.
-This is exactly the "surface it, never silently absorb it" instruction in the
-brief's Part B, just for a mechanism the brief didn't name explicitly — the
-same root cause (a widened `pre_margin_hours` reaching backward far enough to
-collide with an adjacent event) breaks two different functions, not one.
+No lead time and no meaningfully-different chance comparison to report — the
+severity at window-open never crosses its fold's own threshold at any margin,
+matching the calibration finding above exactly.
 
-`split.min_training_days` (guard against pass 13's near-empty-training
-collapse) is set to **30 days** — comfortably below fold 1's fixed 72.00
-days (the tightest value seen anywhere in this sweep, at any margin), high
-enough to catch a genuinely starved config. No fold in this sweep tripped it;
-see `test_min_training_days_guard_raises_naming_fold_and_remaining_days` for
-the guard itself.
-
-#### Part B — Per-event maximum-width cap: verified INVARIANT to `pre_margin_hours`, not tightening
+#### Training days remaining — real costs, no offsetting benefit
 
 | margin | event 1 | event 2 | event 3 | event 4 |
 |---|---|---|---|---|
-| every margin (24h/7d/14d/21d) | 1800.0h | 911.5h | 94.0h | 838.5h |
+| 24h | 72.00/72.00 (100.0%) | 109.98/113.98 (96.5%) | 113.98/120.42 (94.7%) | 148.83/160.60 (92.7%) |
+| 7d | 70.00/72.00 (97.2%) | 101.98/113.98 (89.5%) | 101.98/120.42 (84.7%) | 130.92/160.60 (81.5%) |
+| 14d | 63.00/72.00 (87.5%) | 87.98/113.98 (77.2%) | 87.98/120.42 (73.1%) | 109.92/160.60 (68.4%) |
+| 21d | 56.00/72.00 (77.8%) | 73.98/113.98 (64.9%) | 73.98/120.42 (61.4%) | 88.92/160.60 (55.4%) |
 
-**Identical at every margin tested — verified directly, not assumed.**
-`event_max_width_hours()`'s two constraints (an earlier event's exclusion
-window **END**, anchored on `post_settle_hours`/`fallback_post_hours`; and
-the lead-in-vs-`data_start` bound) never read `pre_margin_hours`, which only
-ever moves an exclusion window's **START** further into the past. A
-window/test_start reaching backward from a later event always meets that
-END first (it is closer), so the START moving further back changes nothing
-this guard checks. The brief anticipated "per-event caps will tighten" —
-**this sweep shows they do not, for a specific, verified, structural
-reason**, not a lack of effort. `test_per_event_caps_invariant_to_pre_margin_and_infeasible_width_still_raises`
-locks this in as a regression test, alongside confirming the pre-existing
-infeasible-width raise still fires once a widened `pre_margin_hours` is
-layered on top of it (the union/merge changes above do not defeat it).
+Event 1 now shrinks too (it did not in §18 at all, ever) — the fix's other
+direct consequence. Every value stays comfortably above
+`split.min_training_days` (30 days) at every margin tested; **no
+(fold, margin) combination raised the guard** in this sweep. Fold 1 at 21d
+(56.00 days) is the tightest of any cell, still well clear.
 
-#### Part D — The honesty requirement: pre_margin_hours stays at 24h; here is why
+Per-event maximum-feasible-width caps (`event_max_width_hours`) remain
+**invariant to `pre_margin_hours`** at every margin (1800.0h / 911.5h / 94.0h
+/ 838.5h for events 1–4, identical throughout) — §18's structural finding
+about this function is unaffected by the exclusion-selection fix, since
+`event_max_width_hours` never read `train_exclusions` in the first place.
 
-**Adopted: `training_exclusion.pre_margin_hours` stays at 24h.** Widening it
-was the entire premise of this pass, motivated by event 2's ~12-day observed
-precursor — an instance of using data-derived knowledge for a
-label-construction decision, which CLAUDE.md permits provided it is recorded
-as a decision, not a neutral default (the brief's explicit requirement). The
-sweep shows widening delivers **no benefit that offsets its costs**:
+#### Design decision (per §18 Part D, re-affirmed): `pre_margin_hours` stays at 24h
 
-- Event 2 is unfixable by this lever at any margin (see the headline finding
-  above) — the mechanism the brief hypothesized would expose it (removing
-  contamination so the calibration's 5th percentile rises past 0.274) does
-  not apply, because `pre_margin_hours` never touches a fold's own event's
-  training data in the first place.
-- Training data shrinks monotonically and materially (Part A) with nothing
-  gained in return.
-- A second, real cost surfaces at close event pairs: widening past ~7d
-  collapses event 2's own false-alarm evaluation window from 7.01 to 3.61
-  days (Part A/C above) via `extend_test_end_for_false_alarms`'s clamp — a
-  worse-supported false-alarm-rate estimate for a fold that was already the
-  thinnest (7.01 days pre-existing, from pass 13).
-- The aggregate skill statistic's small drift with margin (0.737 → 0.636 at
-  72h) is unrelated to event 2 and too small to read as skill gained.
-
-**24h remains the adopted value** — not because it was never questioned, but
-because this pass's sweep is the record of having questioned it and found
-nothing that justifies changing it. Fixing fold 2's own calibration
-contamination would require a genuinely different mechanism: excluding an
-event's own precursor from its own fold's training, which
-`make_folds()` currently and deliberately does not do (`if other.id ==
-event.id: continue` is there for a reason — event 2's own OWN pre-failure
-ramp-up is exactly the region a detection is supposed to credit as
-`early_warning`, not exclude from training as "abnormal" a priori; excluding
-it would risk substituting one form of leakage/circularity for another).
-Whether and how to address that safely is a distinct design question, out of
-this pass's scope — recorded as a follow-up in
-`docs/findings/09-open-questions.md`, not decided here.
-
-#### Part E — Standing limitation: training purity cannot be fully restored by any margin
-
-Recorded in full in `docs/findings/09-open-questions.md` (Part E of this
-pass): degraded-looking operation recurs outside every documented failure
-event (the March cluster, `findings/12-event2-error-analysis.md`) and, as
-this pass additionally shows, a fold's **own** event's precursor is
-structurally un-excludable from its own training by this configuration lever
-regardless of value. No sweep of `pre_margin_hours` removes either source of
-contamination. This applies to every subsequent model (Isolation Forest,
-autoencoder) trained the same way, not just the rule-based baseline.
+The fix changes *why* widening doesn't help, but not *whether* it helps.
+Widening still buys nothing: the aggregate statistic doesn't meaningfully
+move, event 2 and 3 remain undetected at every margin, and training shrinks
+materially with a real, now newly-measured cost that falls disproportionately
+on events with NO documented precursor (event 1's calibration gets noisier,
+not cleaner). `training_exclusion.pre_margin_hours` stays at **24h**, the
+same design decision §18 made, now re-affirmed on corrected evidence rather
+than on a buggy sweep.
 
 #### Bottom line
 
-**The sweep is negative, for a well-understood and now-documented reason, not
-an unexplained one.** Widening `pre_margin_hours` cannot fix event 2's
-detection at any margin tested, because it was never the mechanism
-responsible for the contamination pass 17 found — that contamination comes
-from a fold's own event sitting inside its own training window, a case this
-config value was never designed to reach. The aggregate skill statistic
-stays essentially flat (all p-values 0.2–0.7, no margin/width combination
-remotely significant); event 2 is undetected at every margin; per-event
-caps are verified invariant to this parameter, not tightened as anticipated;
-and a second bug (the false-alarm-extension collision at close event pairs)
-was found and fixed along the way. `training_exclusion.pre_margin_hours`
-stays at 24h. The path to testing whether sustained cycle-duration
-depression is failure-specific — the actual open question pass 17 leaves
-behind — runs through a different mechanism than this one, not through this
-parameter.
+**The fix was necessary and is now verified correct — training exclusion is
+overlap-based, a fold can no longer train on its own target event's
+precursor — but it does not, by itself, produce skill.** The headline
+correction is precise: §18 said `pre_margin_hours` "was never the right
+lever"; it was exactly the right lever, aimed at data it structurally could
+not reach. Now that it reaches, the aggregate skill statistic is still flat,
+event 2 and 3 are still undetected at every margin and quantile tested, and
+the reason is now directly measured rather than inferred: the early-March
+cluster, un-anchored to any documented event, sits at comparably extreme
+values and takes over the calibration's low tail the moment the actually-
+reachable contamination (event 2's own precursor) is removed. This sharpens
+rather than resolves the standing limitation §18 Part E already recorded —
+train-data purity for this dataset cannot be restored by any
+event-margin-based mechanism, because the residual contaminant has no event
+to anchor an exclusion to. That limitation, not the exclusion-selection bug,
+is now the load-bearing open question for every subsequent model.
 
 ---
 
@@ -783,6 +700,284 @@ survives it — not simply maximising the width until something fires.
 ---
 
 ## Superseded results
+
+### 18. Training-exclusion margin sweep — the sweep cannot fix what pass 17 found (pass 18)
+
+> **SUPERSEDED by "20. Exclusion-selection fix (overlap-based)" above.** This
+> section's headline finding — that widening `pre_margin_hours` "was never
+> the right lever" for event 2's calibration contamination — was based on a
+> real bug in `make_folds()`'s exclusion selection (event-identity based,
+> not overlap-based): a fold's own target event's precursor was never
+> excluded from that fold's own training, at any margin, because the fold's
+> own event always starts after that fold's own `train_end`. §20 fixes this
+> and re-runs the identical sweep. The ULTIMATE VERDICT is unchanged (no
+> skill gained, `pre_margin_hours` stays at 24h) but for a corrected reason:
+> not because the parameter structurally could never reach the
+> contamination, but because a second, independent, un-anchored
+> contamination source (the early-March cluster, Part E below) sits at
+> comparably extreme values and continues to set the calibration floor even
+> once the actually-reachable contamination is removed. Kept below,
+> unedited, as the historical record of what pass 18 actually found and
+> why its mechanism-level explanation was wrong — not deleted.
+
+Pass 17 traced event 2's non-detection to calibration contamination: fold 2's
+training window (2020-02-01 → 2020-05-24 23:30) includes the entire mid-May
+collapse as "normal" data, because `training_exclusion.pre_margin_hours` (24h)
+purges only 24h before onset — far short of the ~12-day precursor. This
+section sweeps `pre_margin_hours` over `[24h (reference), 7d, 14d, 21d]` under
+`baseline_mode: lagged` across all four folds, on the real dataset
+(`CONFIG=local`; `data.subset` not applied, per `pipeline.py`'s own
+docstring — full Feb–Aug span needed for walk-forward folds).
+
+**Headline finding, verified directly against the code before being recorded
+(`findings/10-process-lessons.md` discipline): widening `pre_margin_hours`
+cannot fix fold 2's contamination, at any margin, because it was never the
+right lever.** `data/split.py`'s `make_folds()` builds a fold's
+`train_exclusions` only from **other** events (`if other.id == event.id:
+continue`) — a fold never excludes its own event's precursor from its own
+training. Fold 2's mid-May collapse is event 2's **own** precursor, sitting in
+event 2's **own** fold — structurally un-excludable by
+`training_exclusion.pre_margin_hours` regardless of its value, because that
+setting only ever protects a **later** fold from an **earlier** event's
+ramp-up, not an event from itself. This is confirmed directly: fold 1 (the
+earliest event, with no earlier event to exclude at all) shows **byte-identical**
+calibration and detection numbers at every margin tested — its own remaining
+training days (72.00) and `short_stopped_duration` calibration 5th percentile
+(0.1223, lagged) never move, because nothing in this sweep ever touches its
+training slice.
+
+#### Part A — Remaining training days per fold, per margin
+
+| margin | event 1 | event 2 | event 3 | event 4 |
+|---|---|---|---|---|
+| 24h (reference/lagged) | 72.00 / 72.00 (100.0%) | 109.98 / 113.98 (96.5%) | 113.98 / 120.42 (94.7%) | 148.83 / 160.60 (92.7%) |
+| 7d | 72.00 / 72.00 (100.0%) | 103.98 / 113.98 (91.2%) | 101.98 / 120.42 (84.7%) | 132.92 / 160.60 (82.8%) |
+| 14d | 72.00 / 72.00 (100.0%) | 94.42 / 113.98 (82.8%) | 87.98 / 120.42 (73.1%) | 118.92 / 160.60 (74.0%) |
+| 21d | 72.00 / 72.00 (100.0%) | 80.42 / 113.98 (70.6%) | 73.98 / 120.42 (61.4%) | 104.92 / 160.60 (65.3%) |
+
+Training shrinks materially and monotonically as the margin widens — at 21d,
+event 3 loses nearly 39% of its training span, close to the brief's
+"roughly a quarter of fold 4" estimate (fold 4 loses 34.7% — same order).
+Event 1 is flat by construction (see above). Every value stays comfortably
+above `split.min_training_days` (30 days, adopted below) — no fold in this
+sweep collapses toward pass 13's near-empty-training failure mode, though the
+trend shows it is not an implausible future concern at even wider margins.
+
+#### Part A — Calibration 5th percentile (`short_stopped_duration`, the rule pass 17 implicated)
+
+| margin/mode | event 1 | event 2 | event 3 | event 4 |
+|---|---|---|---|---|
+| trailing@24h (reference) | 0.2384 | 0.2146 | 0.2183 | 0.2453 |
+| lagged@24h | 0.1223 | 0.1514 | 0.1496 | 0.1771 |
+| lagged@7d | 0.1223 | 0.1408 | 0.1371 | 0.1794 |
+| lagged@14d | 0.1223 | 0.1362 | 0.1408 | 0.1324 |
+| lagged@21d | 0.1223 | 0.1319 | 0.1215 | 0.1447 |
+
+Event 2's window-open ratio (lagged mode, pass 17) is **0.274**. For
+detection, fold 2's calibration 5th percentile needs to rise **above** 0.274
+so that ratio reads as a high severity rather than "unremarkably low, 5th
+percentile or worse." It never does — and it does not even move in the
+helpful direction: 0.1514 → 0.1408 → 0.1362 → 0.1319 **falls** as the margin
+widens, because widening only removes more of event 1's era (Feb–March) from
+fold 2's training (an unrelated, earlier event), concentrating the *remaining*
+training distribution more heavily around whatever low values (May's own
+collapse, and the March cluster — neither excludable by this lever) are
+already in it. Event 1's own 0.1223 is exactly flat across every margin,
+direct confirmation of the mechanism above.
+
+#### Part A/C — Detection, lead time, false-alarm rates (width=72h, the primary common width)
+
+| event | margin | detected | lead time | fa/day (infold) | eval_days (infold) | fa/day (pooled) | p_poisson | p_perm | flagged |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | trailing@24h | **yes** | 2d22h57m | 0.683 | 32.22 | 0.504 | 0.871 | 0.781 | yes |
+| 1 | lagged@24h | **yes** | 2d22h57m | 0.404 | 32.22 | 0.305 | 0.702 | 0.708 | yes |
+| 1 | lagged@7d | **yes** | 2d22h57m | 0.431 | 27.84 | 0.305 | 0.726 | 0.696 | yes |
+| 1 | lagged@14d | **yes** | 2d22h57m | 0.362 | 22.08 | 0.305 | 0.663 | 0.625 | yes |
+| 1 | lagged@21d | **yes** | 2d22h57m | 0.361 | 16.63 | 0.305 | 0.661 | 0.680 | yes |
+| 2 | trailing@24h | no | — | 0.285 | 7.01 | 0.385 | 0.575 | 0.381 | — |
+| 2 | lagged@24h | no | — | 0.285 | 7.01 | 0.278 | 0.575 | 0.381 | — |
+| 2 | lagged@7d | no | — | 0.277 | 3.61 | 0.305 | 0.564 | 0.185 | — |
+| 2 | lagged@14d | no | — | 0.277 | 3.61 | 0.292 | 0.564 | 0.185 | — |
+| 2 | lagged@21d | no | — | 0.277 | 3.61 | 0.338 | 0.564 | 0.185 | — |
+| 3 | trailing@24h | no | — | 0.426 | 32.83 | 0.371 | 0.722 | 0.503 | — |
+| 3 | lagged@24h | no | — | 0.548 | 32.83 | 0.278 | 0.807 | 0.548 | — |
+| 3 | lagged@7d | no | — | 0.276 | 29.03 | 0.298 | 0.562 | 0.444 | — |
+| 3 | lagged@14d | no | — | 0.310 | 22.58 | 0.298 | 0.606 | 0.540 | — |
+| 3 | lagged@21d | no | — | 0.350 | 17.16 | 0.331 | 0.650 | 0.524 | — |
+| 4 | trailing@24h | **yes** | 0d17h01m | 0.242 | 41.25 | 0.358 | 0.517 | 0.440 | yes |
+| 4 | lagged@24h | **yes** | 0d17h01m | 0.242 | 41.25 | 0.239 | 0.517 | 0.440 | yes |
+| 4 | lagged@7d | **yes** | 1d16h51m | 0.315 | 41.25 | 0.259 | 0.611 | 0.553 | yes |
+| 4 | lagged@14d | **yes** | 1d16h51m | 0.315 | 41.25 | 0.245 | 0.611 | 0.553 | yes |
+| 4 | lagged@21d | **yes** | 0d17h01m | 0.242 | 41.25 | 0.232 | 0.517 | 0.440 | yes |
+
+Event 2 remains undetected at **every** margin tested — the aggregate
+statistic below is the headline, but this row-by-row view already shows there
+is no margin at which fold 2 crosses its own threshold. Event 4's lead time
+shifts between the original 0d17h01m and 1d16h51m at 7d/14d margins (a
+*different* episode becomes the earliest `early_warning` one as fold 4's own
+calibration shifts with its own training exclusions) then reverts at 21d —
+noted as a real, non-monotonic side effect of recalibration, not a
+progression toward a longer lead time.
+
+Event 2's evaluated_days (infold) **drops from 7.01 to 3.61** at 7d+ margins.
+This is a second, distinct consequence of widening surfaced by this sweep
+(Part B below): `extend_test_end_for_false_alarms` (pass 13) pushes a fold's
+false-alarm-counting test_end out to just before the *next* event's exclusion
+window begins — but at a 7d+ margin, event 3's exclusion window now starts
+*before* event 2's own un-extended test_end, so no extension is possible and
+the false-alarm denominator collapses back to its tight, ~3.6-day original
+span. Reported here as a real cost of widening, not folded into "no effect."
+
+#### Aggregate skill statistic — the headline comparison
+
+`expected = Σ p_chance_permutation`; `observed` = detection count (of 4
+folds); `p(X≥observed)` is the exact Poisson-binomial survival probability.
+
+| quantile 0.995 | width | trailing@24h | lagged@24h | lagged@7d | lagged@14d | lagged@21d |
+|---|---|---|---|---|---|---|
+| obs/exp/p | 24h | 2 / 1.032 / 0.271 | 2 / 1.026 / 0.270 | 2 / 0.935 / 0.228 | 2 / 0.903 / 0.217 | 2 / 0.914 / 0.218 |
+| obs/exp/p | 48h | 2 / 1.650 / 0.549 | 2 / 1.646 / 0.547 | 2 / 1.446 / 0.462 | 2 / 1.414 / 0.448 | 2 / 1.374 / 0.427 |
+| obs/exp/p | 72h | 2 / 2.106 / 0.737 | 2 / 2.078 / 0.724 | 2 / 1.878 / 0.658 | 2 / 1.902 / 0.666 | 2 / 1.829 / 0.636 |
+| obs/exp/p | 6h/12h | 0 / (falls with quantile) / 1.000 | same | same | same | same |
+
+The p-value drifts modestly downward as the margin widens (e.g. 72h: 0.737 →
+0.724 → 0.658 → 0.666 → 0.636) — but **this drift is not driven by event 2**
+(still undetected everywhere, contributing nothing to `observed`); it comes
+entirely from events 1 and 3's own false-alarm rates tightening slightly as
+their own earlier-event exclusions widen, lowering their individual
+`p_chance_permutation` inputs to the sum. Observed stays at 2 of 4 across
+every margin tested. **This is not the improvement the brief's first
+anticipated outcome describes** ("detects more, and the aggregate p-value
+falls" because of *event 2*) — it is a small, unrelated, second-order effect
+on the *other* two detecting folds' own calibration. Per the brief's explicit
+requirement: increased margin does **not** buy skill on event 2 at any width
+or margin tested.
+
+#### Part B — Exclusion-region overlap, the union fix, and a second bug it surfaced
+
+At wide margins, exclusion regions from adjacent events overlap (e.g. events
+1/2's own windows would overlap each other were they close enough in time,
+matching the brief's own worked example for events 2/3 at a 14d margin).
+`make_folds()` now takes the union of overlapping exclusion regions before
+storing them on a `Fold` (`_merge_exclusion_windows`), so `train_exclusions`
+is always disjoint — verified directly (`test_overlapping_exclusions_merge_into_one_region`)
+and exercised on real event geometry via `event_max_width_hours`'s own
+pre_margin-invariance below.
+
+**A second, distinct bug surfaced by actually running the sweep, not by
+inspection alone**: `extend_test_end_for_false_alarms` (pass 13) assumed the
+*next* event's exclusion window always starts safely after the *current*
+fold's own test period. At `lagged@14d`, event 3's exclusion window now
+starts 2020-05-22 10:00 — **before** event 2's own `test_start`
+(2020-05-25 23:30) — because event 3 and event 2 are only ~6 days apart and
+14 days now reaches back past event 2's own onset entirely. Unclamped, this
+silently produced `test_end < test_start`, which crashed
+`p_chance_permutation` downstream with an opaque "no candidate placement
+fits" error rather than surfacing the real problem. Fixed by clamping the
+extension to never move `test_end` before the fold's own (un-extended)
+`test_end` — if the next event's exclusion has already swallowed the entire
+would-be extension, no extra false-alarm-counting time is available, full
+stop. Covered by `test_extend_test_end_never_moves_before_folds_own_test_end`.
+This is exactly the "surface it, never silently absorb it" instruction in the
+brief's Part B, just for a mechanism the brief didn't name explicitly — the
+same root cause (a widened `pre_margin_hours` reaching backward far enough to
+collide with an adjacent event) breaks two different functions, not one.
+
+`split.min_training_days` (guard against pass 13's near-empty-training
+collapse) is set to **30 days** — comfortably below fold 1's fixed 72.00
+days (the tightest value seen anywhere in this sweep, at any margin), high
+enough to catch a genuinely starved config. No fold in this sweep tripped it;
+see `test_min_training_days_guard_raises_naming_fold_and_remaining_days` for
+the guard itself.
+
+#### Part B — Per-event maximum-width cap: verified INVARIANT to `pre_margin_hours`, not tightening
+
+| margin | event 1 | event 2 | event 3 | event 4 |
+|---|---|---|---|---|
+| every margin (24h/7d/14d/21d) | 1800.0h | 911.5h | 94.0h | 838.5h |
+
+**Identical at every margin tested — verified directly, not assumed.**
+`event_max_width_hours()`'s two constraints (an earlier event's exclusion
+window **END**, anchored on `post_settle_hours`/`fallback_post_hours`; and
+the lead-in-vs-`data_start` bound) never read `pre_margin_hours`, which only
+ever moves an exclusion window's **START** further into the past. A
+window/test_start reaching backward from a later event always meets that
+END first (it is closer), so the START moving further back changes nothing
+this guard checks. The brief anticipated "per-event caps will tighten" —
+**this sweep shows they do not, for a specific, verified, structural
+reason**, not a lack of effort. `test_per_event_caps_invariant_to_pre_margin_and_infeasible_width_still_raises`
+locks this in as a regression test, alongside confirming the pre-existing
+infeasible-width raise still fires once a widened `pre_margin_hours` is
+layered on top of it (the union/merge changes above do not defeat it).
+
+#### Part D — The honesty requirement: pre_margin_hours stays at 24h; here is why
+
+**Adopted: `training_exclusion.pre_margin_hours` stays at 24h.** Widening it
+was the entire premise of this pass, motivated by event 2's ~12-day observed
+precursor — an instance of using data-derived knowledge for a
+label-construction decision, which CLAUDE.md permits provided it is recorded
+as a decision, not a neutral default (the brief's explicit requirement). The
+sweep shows widening delivers **no benefit that offsets its costs**:
+
+- Event 2 is unfixable by this lever at any margin (see the headline finding
+  above) — the mechanism the brief hypothesized would expose it (removing
+  contamination so the calibration's 5th percentile rises past 0.274) does
+  not apply, because `pre_margin_hours` never touches a fold's own event's
+  training data in the first place.
+- Training data shrinks monotonically and materially (Part A) with nothing
+  gained in return.
+- A second, real cost surfaces at close event pairs: widening past ~7d
+  collapses event 2's own false-alarm evaluation window from 7.01 to 3.61
+  days (Part A/C above) via `extend_test_end_for_false_alarms`'s clamp — a
+  worse-supported false-alarm-rate estimate for a fold that was already the
+  thinnest (7.01 days pre-existing, from pass 13).
+- The aggregate skill statistic's small drift with margin (0.737 → 0.636 at
+  72h) is unrelated to event 2 and too small to read as skill gained.
+
+**24h remains the adopted value** — not because it was never questioned, but
+because this pass's sweep is the record of having questioned it and found
+nothing that justifies changing it. Fixing fold 2's own calibration
+contamination would require a genuinely different mechanism: excluding an
+event's own precursor from its own fold's training, which
+`make_folds()` currently and deliberately does not do (`if other.id ==
+event.id: continue` is there for a reason — event 2's own OWN pre-failure
+ramp-up is exactly the region a detection is supposed to credit as
+`early_warning`, not exclude from training as "abnormal" a priori; excluding
+it would risk substituting one form of leakage/circularity for another).
+Whether and how to address that safely is a distinct design question, out of
+this pass's scope — recorded as a follow-up in
+`docs/findings/09-open-questions.md`, not decided here.
+
+#### Part E — Standing limitation: training purity cannot be fully restored by any margin
+
+Recorded in full in `docs/findings/09-open-questions.md` (Part E of this
+pass): degraded-looking operation recurs outside every documented failure
+event (the March cluster, `findings/12-event2-error-analysis.md`) and, as
+this pass additionally shows, a fold's **own** event's precursor is
+structurally un-excludable from its own training by this configuration lever
+regardless of value. No sweep of `pre_margin_hours` removes either source of
+contamination. This applies to every subsequent model (Isolation Forest,
+autoencoder) trained the same way, not just the rule-based baseline.
+
+#### Bottom line
+
+**The sweep is negative, for a well-understood and now-documented reason, not
+an unexplained one.** Widening `pre_margin_hours` cannot fix event 2's
+detection at any margin tested, because it was never the mechanism
+responsible for the contamination pass 17 found — that contamination comes
+from a fold's own event sitting inside its own training window, a case this
+config value was never designed to reach. The aggregate skill statistic
+stays essentially flat (all p-values 0.2–0.7, no margin/width combination
+remotely significant); event 2 is undetected at every margin; per-event
+caps are verified invariant to this parameter, not tightened as anticipated;
+and a second bug (the false-alarm-extension collision at close event pairs)
+was found and fixed along the way. `training_exclusion.pre_margin_hours`
+stays at 24h. The path to testing whether sustained cycle-duration
+depression is failure-specific — the actual open question pass 17 leaves
+behind — runs through a different mechanism than this one, not through this
+parameter.
+
+---
 
 ### 12. Baseline results (pass 12) — first model scored end-to-end
 

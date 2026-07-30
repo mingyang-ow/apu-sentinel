@@ -1,10 +1,11 @@
 """Ties data -> regimes -> features -> model -> evaluation -> explain
 together, entirely config-driven.
 
-Currently wires only the rule-based baseline (settings.model.rule_based) --
-the model progression in CLAUDE.md is sequential (rule-based -> isolation
-forest -> autoencoder), and later models add their own branch here as they
-are implemented, not all at once.
+Wires the rule-based baseline (run_pipeline, settings.model.rule_based) and,
+as of pass 21, Isolation Forest (run_pipeline_isolation_forest,
+settings.model.isolation_forest) -- the model progression in CLAUDE.md is
+sequential (rule-based -> isolation forest -> autoencoder), and later models
+add their own branch here as they are implemented, not all at once.
 
 The rule-based model deliberately reads RAW (unscaled) channel values, not
 the regime-conditional SCALED tensors data/scaling.py produces: its rules
@@ -58,10 +59,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from apu_sentinel.config import Settings
 from apu_sentinel.data.load import load_raw
+from apu_sentinel.data.scaling import fit_regime_scalers, transform_by_regime
 from apu_sentinel.data.split import (
     Fold,
     apply_fold,
@@ -69,7 +72,7 @@ from apu_sentinel.data.split import (
     extend_test_end_for_false_alarms,
     make_folds,
 )
-from apu_sentinel.data.windows import characterise_sampling
+from apu_sentinel.data.windows import characterise_sampling, make_windows
 from apu_sentinel.evaluation.events import pooled_normal_stretches
 from apu_sentinel.evaluation.metrics import (
     PooledEvaluation,
@@ -79,6 +82,9 @@ from apu_sentinel.evaluation.metrics import (
     evaluate_pooled_stretches,
     fit_threshold,
 )
+from apu_sentinel.features.cycles import compute_cycle_features
+from apu_sentinel.models.base import AnomalyModel
+from apu_sentinel.models.isolation_forest import IsolationForestModel, WindowedInput
 from apu_sentinel.models.rule_based import RuleBasedModel
 from apu_sentinel.regimes import assign_regimes
 
@@ -133,9 +139,9 @@ def _evaluate_at_widths(
     fold: Fold,
     event,
     widths: list[float],
-    model: RuleBasedModel,
-    train_input: pd.DataFrame,
-    fold_input: pd.DataFrame,
+    model: AnomalyModel,
+    train_input,
+    fold_input,
     expected_interval: pd.Timedelta,
     settings: Settings,
 ) -> dict[float, dict[str, object]]:
@@ -143,6 +149,12 @@ def _evaluate_at_widths(
     `widths`, sharing ONE fit + one scoring pass (fit_threshold and the
     score/contributions arrays don't depend on window_width_hours at all
     -- only post-hoc categorisation does).
+
+    Model-agnostic (pass 21): `train_input`/`fold_input` need only expose
+    `.index` (a DatetimeIndex) alongside whatever shape `model.score`/
+    `model.contributions` themselves expect -- the rule-based model's plain
+    per-timestamp DataFrame and IsolationForestModel's WindowedInput (whose
+    `.index` aliases its end_timestamps) both satisfy this.
     """
     train_scores = model.score(train_input)
     full_scores = model.score(fold_input)
@@ -313,6 +325,209 @@ def run_pipeline(settings: Settings) -> dict[int, dict[str, object]]:
             "extended_test_end": extended_fold.test_end,
             "pooled": pooled,
             "per_event_max": per_event_max,
+        }
+
+    return results
+
+
+# --- Pass 21: Isolation Forest (windowed) ------------------------------------
+#
+# Unlike the rule-based baseline, this model needs the FULL pipeline sequence
+# (docs/ARCHITECTURE.md): scale (per-fold, per-regime, train-fitted only) ->
+# compute cycle features (causal, on the RAW channel) -> window. The helpers
+# below mirror _fit_fold_model/_evaluate_pooled_for_fold's shapes above, but
+# build a models.isolation_forest.WindowedInput instead of a rule-based
+# per-timestamp DataFrame. _evaluate_at_widths is REUSED UNCHANGED for both
+# models -- it only ever calls model.score/contributions and reads
+# `fold_input.index`, and WindowedInput.index aliases end_timestamps for
+# exactly this reason.
+
+
+def _windowed_channel_names(settings: Settings) -> tuple[str, ...]:
+    """make_windows()'s own documented channel order -- analog_columns then
+    passthrough_columns.
+    """
+    return tuple(settings.scaling.analog_columns) + tuple(settings.scaling.passthrough_columns)
+
+
+def _build_windowed_input(
+    raw_df: pd.DataFrame,
+    regimes: pd.Series,
+    scalers: dict,
+    settings: Settings,
+    stride_mode: str,
+) -> WindowedInput:
+    """Scale raw_df with an ALREADY-FITTED (train-only) scaler set, compute
+    cycle features on the RAW channel (causal, same discipline as the
+    rule-based model), then window -- the bundle IsolationForestModel reads.
+    `raw_df`/`regimes` need not share an index (regimes is sliced onto
+    raw_df's here); scalers must come from fit_regime_scalers() on this
+    fold's clean training slice.
+    """
+    df_regimes = regimes.loc[raw_df.index]
+    scaled = transform_by_regime(raw_df, df_regimes, scalers, settings)
+    windows, end_timestamps = make_windows(scaled, settings, stride_mode=stride_mode)
+
+    cycle_features = None
+    if settings.model.isolation_forest.include_cycle_features:
+        decay_channel = settings.features.decay_source_channel
+        cycle_features = compute_cycle_features(raw_df[[decay_channel]], df_regimes, settings)
+
+    return WindowedInput(
+        windows=windows,
+        end_timestamps=pd.DatetimeIndex(end_timestamps),
+        channel_names=_windowed_channel_names(settings),
+        cycle_features=cycle_features,
+    )
+
+
+def _fit_fold_isolation_forest(
+    df: pd.DataFrame,
+    regimes: pd.Series,
+    fold: Fold,
+    settings: Settings,
+) -> tuple[IsolationForestModel, dict, WindowedInput, WindowedInput]:
+    """Fit-on-train-only scalers AND model, then return (model, scalers,
+    train_input, fold_input) -- fold_input spans train_start..fold.test_end
+    (continuous history for causal scoring, same rationale as the
+    rule-based model's fold_input); train_input is the clean,
+    exclusion-purged training slice alone. `scalers` is returned too since
+    _evaluate_pooled_for_fold_windowed needs the SAME fitted scalers to
+    score pooled stretches with this fold's model.
+    """
+    train_raw, _ = apply_fold(df, fold)
+    fold_full = df.loc[(df.index >= fold.train_start) & (df.index <= fold.test_end)]
+
+    train_regimes = regimes.loc[train_raw.index]
+    scalers = fit_regime_scalers(train_raw, train_regimes, settings, fold_id=fold.event_id)
+
+    train_input = _build_windowed_input(train_raw, regimes, scalers, settings, stride_mode="train")
+    fold_input = _build_windowed_input(fold_full, regimes, scalers, settings, stride_mode="score")
+
+    model = IsolationForestModel(settings)
+    model.fit(train_input)
+    return model, scalers, train_input, fold_input
+
+
+def _evaluate_pooled_for_fold_windowed(
+    df: pd.DataFrame,
+    regimes: pd.Series,
+    model: IsolationForestModel,
+    scalers: dict,
+    threshold: float,
+    stretches,
+    settings: Settings,
+) -> PooledEvaluation:
+    """Windowed equivalent of _evaluate_pooled_for_fold: scores every pooled
+    normal stretch with this fold's ALREADY-FITTED model and scalers, then
+    pools the false-alarm rate across them (Part B2). A stretch shorter
+    than one window (or empty) yields zero windows -- make_windows()
+    already returns empty tensors for that case, never raises, EXCEPT for a
+    genuinely empty DataFrame, guarded here the same way the rule-based
+    version guards it.
+
+    Contributions are NEVER computed here: evaluate_pooled_stretches() only
+    ever reads test_data.scores/timestamps (episode counting, no ranked
+    diagnosis is attached to a pooled stretch) -- a zero placeholder of the
+    right shape satisfies ScoredTestData without paying ablation's
+    O(n_features) re-scoring cost across every pooled stretch, which for
+    this model (unlike the rule-based baseline's cheap percentile lookup)
+    would dominate runtime for no observable effect on the result.
+    """
+    scored_stretches = []
+    n_contributors = len(model.contributor_names)
+    for stretch in stretches:
+        stretch_df = df.loc[(df.index >= stretch.start) & (df.index <= stretch.end)]
+        if stretch_df.empty:
+            scored_stretches.append(
+                ScoredTestData(
+                    timestamps=pd.DatetimeIndex([]),
+                    scores=np.empty(0),
+                    contributions=np.empty((0, n_contributors)),
+                    channel_names=model.contributor_names,
+                    expected_interval=pd.Timedelta(seconds=1),
+                )
+            )
+            continue
+        stretch_input = _build_windowed_input(
+            stretch_df, regimes, scalers, settings, stride_mode="score"
+        )
+        scores = model.score(stretch_input) if stretch_input.windows.shape[0] else np.empty(0)
+        scored_stretches.append(
+            ScoredTestData(
+                timestamps=stretch_input.end_timestamps,
+                scores=scores,
+                contributions=np.zeros((len(scores), n_contributors)),
+                channel_names=model.contributor_names,
+                expected_interval=pd.Timedelta(seconds=10),
+            )
+        )
+    return evaluate_pooled_stretches(stretches, scored_stretches, threshold, settings)
+
+
+def run_pipeline_isolation_forest(settings: Settings) -> dict[int, dict[str, object]]:
+    """Isolation Forest across every walk-forward fold, common widths only
+    (no per-event-max sensitivity set -- not needed for this model's own
+    evaluation, unlike the rule-based baseline's pass-13 Part C). Mirrors
+    run_pipeline()'s per-fold reporting shape: {event_id: {"common_widths":
+    ..., "extended_test_end": ..., "pooled": ...}}.
+
+    Raises:
+        NotImplementedError: if settings.model.isolation_forest is not
+            configured.
+    """
+    if settings.model.isolation_forest is None:
+        raise NotImplementedError(
+            "run_pipeline_isolation_forest requires settings.model.isolation_forest "
+            "to be configured."
+        )
+
+    raw_path = Path(settings.data.raw_dir) / settings.data.raw_filename
+    df = load_raw(raw_path)
+    data_start, data_end = df.index.min(), df.index.max()
+
+    regimes = assign_regimes(df, settings)
+    common_folds = make_folds(settings, data_start, data_end)
+
+    sampling = characterise_sampling(df, pd.Timedelta(settings.windowing.gap_threshold))
+    expected_interval = sampling.modal_interval
+
+    events_sorted = sorted(settings.evaluation.failure_events, key=lambda e: pd.Timestamp(e.start))
+    events_by_id = {event.id: event for event in events_sorted}
+    training_exclusion = settings.split.training_exclusion
+
+    stretches = pooled_normal_stretches(settings, data_start, data_end)
+
+    results: dict[int, dict[str, object]] = {}
+    for fold in common_folds:
+        event = events_by_id[fold.event_id]
+
+        extended_fold = extend_test_end_for_false_alarms(
+            fold, event, events_sorted, training_exclusion, data_end
+        )
+        model, scalers, train_input, fold_input = _fit_fold_isolation_forest(
+            df, regimes, extended_fold, settings
+        )
+        common_widths = _evaluate_at_widths(
+            extended_fold,
+            event,
+            settings.evaluation.window_widths,
+            model,
+            train_input,
+            fold_input,
+            expected_interval,
+            settings,
+        )
+
+        threshold = fit_threshold(model.score(train_input), settings)
+        pooled = _evaluate_pooled_for_fold_windowed(
+            df, regimes, model, scalers, threshold, stretches, settings
+        )
+
+        results[fold.event_id] = {
+            "common_widths": common_widths,
+            "extended_test_end": extended_fold.test_end,
+            "pooled": pooled,
         }
 
     return results

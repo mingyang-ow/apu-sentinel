@@ -33,4 +33,24 @@
   never from `scaling.analog_columns`. Lesson: a contract test earns its keep
   by being exercised against a real implementation as early as possible, not
   just against a mock.
+- **A correct-looking implementation of a wrong specification produced a
+  misleading negative result, and was only caught by asking why (pass 20).**
+  Pass 5's brief specified excluding "all earlier events'" training-exclusion
+  regions from each fold. `make_folds()` implemented that literally: `if
+  other.id == event.id: continue` -- skip the fold's own event, keep every
+  other one. This passed every test written against it (including pass 18's
+  own new tests) for 15 passes, because "earlier event" was the only case
+  anyone had reason to construct a fixture for. The actual bug: a fold's own
+  target event starts AFTER that fold's own `train_end` by construction (that
+  is what makes it a future event to predict), so its own precursor was never
+  excluded from its own training, at ANY `pre_margin_hours` value -- the
+  parameter was reaching for data it could never touch. Pass 18's margin
+  sweep came back completely flat as a direct, deterministic consequence, and
+  read at face value as "this lever doesn't work." It was only caught by
+  refusing to accept that reading and asking why a mechanism that should
+  provably work at some margin showed zero response at any margin tested --
+  the flatness itself was the tell, not a shrug-worthy null result. Lesson: a
+  specification can be implemented faithfully and still be wrong; a negative
+  sweep result is itself evidence to interrogate, not just report, especially
+  when the direction of the non-effect is total rather than merely weak.
 
