@@ -366,3 +366,23 @@ model:
       enabled: false
     # Pass 22 diagnostic (docs/RESULTS.md): default off.
     exclude_gap_adjacent_windows: false
+  # Pass 23 v2: third and final stage of the model progression (CLAUDE.md).
+  # One 1D convolutional autoencoder per fold, fit on that fold's clean
+  # training windows (the 15 scaled channels only, no cycle features -- see
+  # models/autoencoder.py). Dims kept small: this project has only a
+  # handful of documented failures to validate against, so a large capacity
+  # model risks overfitting to normal-operation noise long before it could
+  # ever be justified by held-out skill. Conv (not the pass 23 LSTM, which
+  # hung on CPU) -- see models/autoencoder.py module docstring.
+  autoencoder:
+    channels: [32, 16]
+    kernel_size: 5
+    bottleneck_dim: 8
+    dropout: 0.0
+    activation: relu
+    learning_rate: 0.001
+    batch_size: 64
+    random_state: 42
+    val_fraction: 0.15
+    patience: 5
+    deterministic: false

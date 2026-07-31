@@ -471,6 +471,53 @@ class IsolationForestModelConfig(BaseModel):
     exclude_gap_adjacent_windows: bool = False
 
 
+class AutoencoderModelConfig(BaseModel):
+    """models/autoencoder.py: 1D convolutional autoencoder, one instance per
+    fold.
+
+    Third and final stage of the model progression (CLAUDE.md). Reads
+    WindowedInput with cycle_features=None (docs/RESULTS.md §22's NaN
+    imputation path is deliberately not exercised by this model) -- input
+    is the scaled channels only, so there is no include_cycle_features
+    toggle here unlike IsolationForestModelConfig.
+
+    Conv, not LSTM (pass 23 v2): convolutions parallelise across the time
+    axis, so training actually uses all CPU cores instead of stepping
+    through 180 timesteps sequentially per window -- the LSTM version hung
+    on CPU for exactly this reason. The cross-channel-relationship
+    hypothesis this model tests does not need sequential modelling anyway.
+    """
+
+    model_config = _STRICT
+
+    # Encoder layer widths, e.g. [32, 16] -- each is a stride-2 Conv1d
+    # narrowing both channel width and time length; the decoder mirrors
+    # this list in reverse with ConvTranspose1d. Local smoke config uses a
+    # much smaller list (see configs/local.yaml).
+    channels: list[int] = Field(default_factory=lambda: [32, 16])
+    # Must be odd -- padding=kernel_size//2 relies on symmetric "same"
+    # padding at stride 1; see models/autoencoder.py _ConvAutoencoderNet.
+    kernel_size: int = 5
+    bottleneck_dim: int = 8
+    dropout: float = 0.0
+    activation: Literal["relu", "gelu", "leaky_relu"] = "relu"
+    learning_rate: float = 1e-3
+    batch_size: int = 64
+    random_state: int = 42
+    # Trailing fraction of a fold's (time-ordered) training windows held out
+    # for early-stopping validation -- a TRAILING block, never a random
+    # sample, so validation never sees windows chronologically interleaved
+    # with training ones. See models/autoencoder.py fit()'s docstring.
+    val_fraction: float = 0.15
+    # Early-stopping patience, in epochs of no validation-loss improvement.
+    patience: int = 5
+    # Full bit-for-bit GPU determinism needs torch.use_deterministic_algorithms
+    # plus CUBLAS_WORKSPACE_CONFIG, both of which cost speed -- OFF by default.
+    # Only matters on CUDA; CPU training is already deterministic without it
+    # for this architecture (no shuffling, no nondeterministic CUDA kernels).
+    deterministic: bool = False
+
+
 class ModelConfig(BaseModel):
     """Container for the currently-selected model's own config subtree.
 
@@ -484,6 +531,7 @@ class ModelConfig(BaseModel):
 
     rule_based: RuleBasedModelConfig | None = None
     isolation_forest: IsolationForestModelConfig | None = None
+    autoencoder: AutoencoderModelConfig | None = None
 
 
 class Settings(BaseSettings):

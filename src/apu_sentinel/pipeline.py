@@ -58,6 +58,7 @@ reports, per fold:
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 import numpy as np
@@ -86,6 +87,7 @@ from apu_sentinel.evaluation.metrics import (
     fit_threshold_sweep,
 )
 from apu_sentinel.features.cycles import compute_cycle_features
+from apu_sentinel.models.autoencoder import AutoencoderModel
 from apu_sentinel.models.base import AnomalyModel
 from apu_sentinel.models.isolation_forest import IsolationForestModel, WindowedInput
 from apu_sentinel.models.rule_based import RuleBasedModel
@@ -791,4 +793,303 @@ def evaluate_isolation_forest_fold(
         "extended_test_end": extended_fold.test_end,
         "pooled": pooled,
         "pooled_by_quantile": pooled_by_quantile,
+    }
+
+
+# --- Pass 23: LSTM Autoencoder (windowed, no cycle features) ---------------
+#
+# Mirrors _fit_fold_isolation_forest/_build_windowed_input's shape, but never
+# computes cycle features (models/autoencoder.py's module docstring: this
+# model reads the 15 scaled channels only, sidestepping the NaN-imputation
+# path in docs/RESULTS.md §22 Part A1) and never touches the isolation
+# forest's own functions -- a parallel section, not a refactor of it.
+#
+# Evaluation deliberately does NOT sweep (width x quantile) the way
+# evaluate_isolation_forest_fold does (docs/RESULTS.md §22's own lesson: a
+# 160-cell sweep produces a maximum, not a p-value). Instead, run_pipeline_
+# autoencoder selects ONE pre-registered operating point per the pass-22
+# Part B rule -- width fixed at 72h, quantile the LOOSEST of
+# evaluation.threshold_quantiles whose POOLED false-alarm rate, taken as the
+# worst case (max) across every fold, is <= POOLED_FALSE_ALARM_CEILING --
+# and evaluates every fold at that single point only.
+
+OPERATING_POINT_WIDTH_HOURS = 72.0
+# Reuses docs/RESULTS.md §22 Part B's selection ceiling verbatim -- not
+# re-derived here, so this model's operating point is chosen by the same
+# rule already applied to Isolation Forest, not a new one picked to flatter
+# this model.
+POOLED_FALSE_ALARM_CEILING = 0.3
+
+
+def _build_windowed_input_autoencoder(
+    raw_df: pd.DataFrame,
+    regimes: pd.Series,
+    scalers: dict,
+    settings: Settings,
+    stride_mode: str,
+) -> WindowedInput:
+    """Scale + window raw_df with an ALREADY-FITTED (train-only) scaler set
+    -- no cycle features, ever (cycle_features=None): unlike
+    _build_windowed_input (models/isolation_forest.py's caller), this
+    builder has no include_cycle_features branch to take.
+    """
+    df_regimes = regimes.loc[raw_df.index]
+    scaled = transform_by_regime(raw_df, df_regimes, scalers, settings)
+    windows, end_timestamps = make_windows(scaled, settings, stride_mode=stride_mode)
+    return WindowedInput(
+        windows=windows,
+        end_timestamps=pd.DatetimeIndex(end_timestamps),
+        channel_names=_windowed_channel_names(settings),
+        cycle_features=None,
+    )
+
+
+def _fit_fold_autoencoder(
+    df: pd.DataFrame,
+    regimes: pd.Series,
+    fold: Fold,
+    settings: Settings,
+) -> tuple[AutoencoderModel, dict, WindowedInput, WindowedInput]:
+    """Fit-on-train-only scalers AND model, then return (model, scalers,
+    train_input, fold_input) -- same shape as _fit_fold_isolation_forest.
+    """
+    train_raw, _ = apply_fold(df, fold)
+    fold_full = df.loc[(df.index >= fold.train_start) & (df.index <= fold.test_end)]
+
+    train_regimes = regimes.loc[train_raw.index]
+    scalers = fit_regime_scalers(train_raw, train_regimes, settings, fold_id=fold.event_id)
+
+    train_input = _build_windowed_input_autoencoder(
+        train_raw, regimes, scalers, settings, stride_mode="train"
+    )
+    fold_input = _build_windowed_input_autoencoder(
+        fold_full, regimes, scalers, settings, stride_mode="score"
+    )
+
+    model = AutoencoderModel(settings)
+    model.fit(train_input)
+    return model, scalers, train_input, fold_input
+
+
+def _score_pooled_stretches_autoencoder(
+    df: pd.DataFrame,
+    regimes: pd.Series,
+    model: AutoencoderModel,
+    scalers: dict,
+    stretches,
+    settings: Settings,
+) -> list[ScoredTestData]:
+    """Windowed equivalent of _score_pooled_stretches_windowed, without
+    cycle features. Contributions are never computed here for the same
+    reason as the isolation forest version: evaluate_pooled_stretches()
+    only ever reads test_data.scores/timestamps.
+    """
+    scored_stretches = []
+    n_contributors = len(model.contributor_names)
+    for stretch in stretches:
+        stretch_df = df.loc[(df.index >= stretch.start) & (df.index <= stretch.end)]
+        if stretch_df.empty:
+            scored_stretches.append(
+                ScoredTestData(
+                    timestamps=pd.DatetimeIndex([]),
+                    scores=np.empty(0),
+                    contributions=np.empty((0, n_contributors)),
+                    channel_names=model.contributor_names,
+                    expected_interval=pd.Timedelta(seconds=1),
+                )
+            )
+            continue
+        stretch_input = _build_windowed_input_autoencoder(
+            stretch_df, regimes, scalers, settings, stride_mode="score"
+        )
+        scores = model.score(stretch_input) if stretch_input.windows.shape[0] else np.empty(0)
+        scored_stretches.append(
+            ScoredTestData(
+                timestamps=stretch_input.end_timestamps,
+                scores=scores,
+                contributions=np.zeros((len(scores), n_contributors)),
+                channel_names=model.contributor_names,
+                expected_interval=pd.Timedelta(seconds=10),
+            )
+        )
+    return scored_stretches
+
+
+def pooled_at_quantiles_autoencoder(
+    df: pd.DataFrame,
+    regimes: pd.Series,
+    model: AutoencoderModel,
+    scalers: dict,
+    train_scores: np.ndarray,
+    stretches,
+    settings: Settings,
+) -> dict[float, PooledEvaluation]:
+    """pooled_at_quantiles() (models/isolation_forest.py's pipeline
+    counterpart), without cycle features -- one scoring pass over the
+    pooled stretches, evaluated at every evaluation.threshold_quantiles
+    entry, needed by select_operating_quantile() below.
+    """
+    scored_stretches = _score_pooled_stretches_autoencoder(
+        df, regimes, model, scalers, stretches, settings
+    )
+    thresholds = fit_threshold_sweep(train_scores, settings)
+    return {
+        q: evaluate_pooled_stretches(stretches, scored_stretches, threshold, settings)
+        for q, threshold in thresholds.items()
+    }
+
+
+def select_operating_quantile(
+    pooled_by_quantile_per_fold: dict[int, dict[float, PooledEvaluation]],
+    ceiling: float,
+) -> float:
+    """docs/RESULTS.md §22 Part B's selection rule, reused verbatim: the
+    LOOSEST swept quantile whose pooled false-alarm rate, taken as the
+    WORST CASE (max) across every fold, is <= ceiling -- going tighter than
+    necessary sacrifices sensitivity for no operational benefit. Selection
+    depends only on false-alarm behaviour, never on detection outcomes.
+
+    Raises:
+        ValueError: if no swept quantile satisfies the ceiling in every
+            fold.
+    """
+    quantiles = sorted(next(iter(pooled_by_quantile_per_fold.values())).keys())
+    for q in quantiles:
+        worst = max(
+            pooled_by_quantile_per_fold[fold_id][q].false_alarms_per_day
+            for fold_id in pooled_by_quantile_per_fold
+        )
+        if worst <= ceiling:
+            return q
+    raise ValueError(
+        f"no swept quantile (evaluation.threshold_quantiles={quantiles}) keeps the "
+        f"worst-case pooled false-alarm rate across all folds under the ceiling "
+        f"({ceiling}/day) -- widen the quantile grid or raise the ceiling deliberately."
+    )
+
+
+def run_pipeline_autoencoder(settings: Settings) -> dict[str, object]:
+    """LSTM Autoencoder across every walk-forward fold (arm A only -- March
+    included, common folds, no additional_regions), evaluated at ONE
+    pre-registered operating point (docs/RESULTS.md §22 Part B's rule,
+    reused verbatim -- see select_operating_quantile). Never sweeps
+    (width x quantile): docs/RESULTS.md §22's own lesson is that a wide
+    sweep reports a maximum, not a p-value.
+
+    Returns {"operating_point": {"width_hours", "quantile"},
+             "folds": {event_id: {"result": FoldEvaluation,
+                                   "chance": ChanceComparison,
+                                   "pooled": PooledEvaluation,
+                                   "training_summary": {...}}}}.
+
+    Raises:
+        NotImplementedError: if settings.model.autoencoder is not
+            configured.
+        ValueError: from select_operating_quantile if no swept quantile
+            satisfies the pooled false-alarm ceiling in every fold.
+    """
+    if settings.model.autoencoder is None:
+        raise NotImplementedError(
+            "run_pipeline_autoencoder requires settings.model.autoencoder to be configured."
+        )
+
+    raw_path = Path(settings.data.raw_dir) / settings.data.raw_filename
+    df = load_raw(raw_path)
+    data_start, data_end = df.index.min(), df.index.max()
+
+    regimes = assign_regimes(df, settings)
+    common_folds = make_folds(settings, data_start, data_end)
+
+    sampling = characterise_sampling(df, pd.Timedelta(settings.windowing.gap_threshold))
+    expected_interval = sampling.modal_interval
+
+    events_sorted = sorted(settings.evaluation.failure_events, key=lambda e: pd.Timestamp(e.start))
+    events_by_id = {event.id: event for event in events_sorted}
+    training_exclusion = settings.split.training_exclusion
+
+    stretches = pooled_normal_stretches(settings, data_start, data_end)
+
+    per_fold: dict[int, dict[str, object]] = {}
+    for fold in common_folds:
+        event = events_by_id[fold.event_id]
+        extended_fold = extend_test_end_for_false_alarms(
+            fold, event, events_sorted, training_exclusion, data_end
+        )
+
+        start = time.monotonic()
+        model, scalers, train_input, fold_input = _fit_fold_autoencoder(
+            df, regimes, extended_fold, settings
+        )
+        logger.info(
+            "run_pipeline_autoencoder: fold %d fit in %.1fs (epochs_run=%d "
+            "final_train_loss=%.6f final_val_loss=%s device=%s)",
+            fold.event_id,
+            time.monotonic() - start,
+            model.epochs_run_,
+            model.final_train_loss_,
+            model.final_val_loss_,
+            model.device_,
+        )
+
+        train_scores = model.score(train_input)
+        pooled_by_quantile = pooled_at_quantiles_autoencoder(
+            df, regimes, model, scalers, train_scores, stretches, settings
+        )
+
+        per_fold[fold.event_id] = {
+            "fold": extended_fold,
+            "event": event,
+            "model": model,
+            "fold_input": fold_input,
+            "train_scores": train_scores,
+            "pooled_by_quantile": pooled_by_quantile,
+        }
+
+    chosen_quantile = select_operating_quantile(
+        {fold_id: entry["pooled_by_quantile"] for fold_id, entry in per_fold.items()},
+        POOLED_FALSE_ALARM_CEILING,
+    )
+
+    results: dict[int, dict[str, object]] = {}
+    for fold_id, entry in per_fold.items():
+        fold, event, model = entry["fold"], entry["event"], entry["model"]
+        fold_input = entry["fold_input"]
+
+        threshold = fit_threshold_sweep(entry["train_scores"], settings)[chosen_quantile]
+        full_scores = model.score(fold_input)
+        full_contributions = model.contributions(fold_input)
+
+        test_mask = (fold_input.index >= fold.test_start) & (fold_input.index <= fold.test_end)
+        test_data = ScoredTestData(
+            timestamps=fold_input.index[test_mask],
+            scores=full_scores[test_mask],
+            contributions=full_contributions[test_mask],
+            channel_names=model.contributor_names,
+            expected_interval=expected_interval,
+        )
+
+        result = evaluate_fold_at_threshold(
+            fold, event, OPERATING_POINT_WIDTH_HOURS, threshold, test_data, settings
+        )
+        chance = evaluate_chance(result, fold, settings)
+
+        results[fold_id] = {
+            "result": result,
+            "chance": chance,
+            "pooled": entry["pooled_by_quantile"][chosen_quantile],
+            "training_summary": {
+                "epochs_run": model.epochs_run_,
+                "final_train_loss": model.final_train_loss_,
+                "final_val_loss": model.final_val_loss_,
+                "elapsed_seconds": model.elapsed_seconds_,
+                "device": model.device_,
+            },
+        }
+
+    return {
+        "operating_point": {
+            "width_hours": OPERATING_POINT_WIDTH_HOURS,
+            "quantile": chosen_quantile,
+        },
+        "folds": results,
     }

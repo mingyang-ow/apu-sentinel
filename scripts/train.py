@@ -21,7 +21,17 @@ import signal
 import sys
 
 from apu_sentinel.config import load_config
-from apu_sentinel.pipeline import run_pipeline
+from apu_sentinel.pipeline import (
+    run_pipeline,
+    run_pipeline_autoencoder,
+    run_pipeline_isolation_forest,
+)
+
+PIPELINES = {
+    "rule_based": run_pipeline,
+    "isolation_forest": run_pipeline_isolation_forest,
+    "autoencoder": run_pipeline_autoencoder,
+}
 
 
 class TrainingBudgetExceeded(Exception):
@@ -54,6 +64,7 @@ def _best_effort_colab_disconnect() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="local", choices=["local", "colab"])
+    parser.add_argument("--model", default="rule_based", choices=list(PIPELINES))
     args = parser.parse_args()
 
     settings = load_config(args.config)
@@ -61,7 +72,7 @@ def main() -> int:
 
     result = None
     try:
-        result = run_pipeline(settings)
+        result = PIPELINES[args.model](settings)
     finally:
         signal.alarm(0)
         try:

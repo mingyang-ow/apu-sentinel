@@ -8,4 +8,35 @@ data:
 
 train:
   epochs: 2
-  max_minutes: 5 # wall-clock budget guard, see scripts/train.py
+  max_minutes: 1 # wall-clock budget guard, see scripts/train.py
+
+# Pass 23 v2 Part C: the autoencoder's local run must be a code-path check,
+# not training -- it has to finish in seconds. Isolation Forest's local run
+# (docs/RESULTS.md §21/§22) uses the full real CSV and all 4 folds and still
+# finishes in ~200s because sklearn's forest is cheap per window; a neural
+# net doing real gradient steps over that same window count is not (this is
+# what actually hung the pass-23 LSTM attempt, not memory). Restricting to
+# one documented event (below) and coarsening train_stride/score_stride are
+# config-only, so the SAME pipeline code runs -- just over a tiny slice.
+evaluation:
+  failure_events:
+    - id: 1
+      start: "2020-04-18 00:00"
+      end: "2020-04-18 23:59"
+      maintenance: null
+      note: "No maintenance entry in the source table; repair time unknown."
+
+windowing:
+  # ~200 training windows over event 1's ~70-day training span (data starts
+  # 2020-02-01), instead of the real ~5min stride's tens of thousands.
+  train_stride: 8h
+  # Coarsens the pooled-normal-stretch and full-fold scoring passes (run
+  # once per fold, over spans of weeks to months) to the same order of
+  # magnitude -- otherwise scoring, not training, would dominate wall time.
+  score_stride: 30min
+
+model:
+  autoencoder:
+    channels: [16, 8]
+    kernel_size: 3
+    bottleneck_dim: 4

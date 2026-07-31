@@ -10,6 +10,7 @@ the record, the same principle as the April-gap correction in
 ## Contents
 
 **Current**
+- [23. Convolutional autoencoder — architecture + local smoke validation; Colab operating-point run pending (pass 23 v2)](#23-convolutional-autoencoder--architecture--local-smoke-validation-colab-operating-point-run-pending-pass-23-v2)
 - [22. Event-4 detection validation: gap-artifact check negative, no aggregate skill at the pre-registered operating point (pass 22)](#22-event-4-detection-validation-gap-artifact-check-negative-no-aggregate-skill-at-the-pre-registered-operating-point-pass-22)
 - [21. Isolation Forest: arm A/B + quantile sweep, explained detections (pass 21)](#21-isolation-forest-arm-ab--quantile-sweep-explained-detections-pass-21)
 - [20. Exclusion-selection fix (overlap-based) — the lever now reaches, and it still isn't enough (pass 20)](#20-exclusion-selection-fix-overlap-based--the-lever-now-reaches-and-it-still-isnt-enough-pass-20)
@@ -24,6 +25,68 @@ the record, the same principle as the April-gap correction in
 ---
 
 ## Current results
+
+### 23. Convolutional autoencoder — architecture + local smoke validation; Colab operating-point run pending (pass 23 v2)
+
+Replaces pass 23's LSTM version, which hung on CPU during the local smoke
+check -- diagnosed as compute-bound (16 idle cores, 4.9Gi free, 0B swap),
+not memory: an LSTM steps through all 180 timesteps per window
+sequentially, so nothing in the batch parallelises across cores. This
+version uses a 1D convolutional encoder/decoder instead (`models/
+autoencoder.py` `_ConvAutoencoderNet`), which processes the time axis in
+parallel matmuls.
+
+**Architecture**: encoder = stacked stride-2 `Conv1d` layers (narrowing
+both channel width, per `model.autoencoder.channels`, and time length) ->
+flatten -> linear bottleneck (`bottleneck_dim`); decoder mirrors with
+`ConvTranspose1d`. Each decoder layer's `output_padding` is solved exactly
+from its corresponding encoder layer's own (input_length, output_length)
+pair (not assumed), so the round trip lands on `window_length` exactly
+even when it doesn't divide evenly by `2**len(channels)` --
+`tests/test_autoencoder.py`'s shape round-trip test covers this directly
+across several (window_length, channels, kernel_size) combinations,
+including the real config's own (180, [32, 16], 5) shape. Input is the 15
+scaled channels only (no cycle features), score = mean squared
+reconstruction error over timesteps and channels, contributions =
+per-channel reconstruction error -- same contract shape as pass 23's LSTM
+version; only the network's internals changed.
+
+**Config** (`configs/base.yaml`): `channels: [32, 16]`, `kernel_size: 5`,
+`bottleneck_dim: 8`, `dropout: 0.0`, `activation: relu`, `learning_rate:
+0.001`, `batch_size: 64`, `val_fraction: 0.15`, `patience: 5`.
+
+**Local smoke config** (`configs/local.yaml`): restricted to `evaluation.
+failure_events` = event 1 only (1 fold, config-only -- the same pipeline
+code runs, just over a tiny slice), `windowing.train_stride: 8h` /
+`score_stride: 30min` (real defaults are 5min/1min; coarsened so scoring
+the whole series doesn't dominate wall time the way it would with a real
+neural net, unlike Isolation Forest's cheap per-window sklearn scoring),
+`model.autoencoder.channels: [16, 8]`, `kernel_size: 3`, `bottleneck_dim:
+4`, `train.max_minutes: 1`.
+
+**Local smoke run** (`CONFIG=local uv run python scripts/train.py --config
+local --model autoencoder`): completed in **14.3s wall-clock** (mostly the
+1.5M-row CSV load and regime/scaling passes -- the model fit itself was
+**0.05s**, `epochs_run=2`, `final_train_loss=2.516`, `final_val_loss=
+2.504`, device=cpu). Confirms fit -> score -> contributions -> evaluation
+runs end to end without hanging. This is a code-path check only, per Part
+C -- not a result, and not run against production hyperparameters.
+
+**Tests**: 9 CPU-only tests (`tests/test_autoencoder.py`, 10 including the
+pre-existing zero-arg-constructible check) pass, covering protocol
+conformance, score direction, per-channel attribution, fit-is-train-only,
+time-based validation split, determinism, constant-channel near-zero
+contribution, `max_minutes` budget enforcement, and the shape round-trip.
+Full suite: 149 passed, 1 skipped (pre-existing, unrelated). Lint clean.
+
+**Not yet done**: the real Colab run (`configs/colab.yaml`, full data, real
+epochs/budget) that produces the actual per-fold training logs, the
+pre-registered operating point (72h width, loosest quantile with pooled
+false-alarm rate ≤ 0.3/day), the aggregate skill statistic, and the
+four-way comparison against rule-based / Isolation Forest arm A / arm B.
+Per CLAUDE.md and this brief, training never happens on the laptop -- that
+step requires an actual Colab GPU runtime and is not run here. This section
+will be updated with those results once that run completes.
 
 ### 22. Event-4 detection validation: gap-artifact check negative, no aggregate skill at the pre-registered operating point (pass 22)
 
