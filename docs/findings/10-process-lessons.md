@@ -71,4 +71,22 @@
   be read off a point chosen before the sweep, or by a rule stated and
   applied independently of the sweep's own outcomes; the single most
   extreme cell in a wide grid is not that, however small its p-value looks.
+- **A crash in operating-point selection destroyed a completed GPU run
+  (pass 23/24).** `select_operating_quantile` raised `ValueError` when no
+  swept quantile kept the worst-case pooled false-alarm rate under the
+  ceiling. On the real Colab run this happened AFTER a full, successful
+  four-fold training pass — the exception unwound past the point where
+  anything about that training run got saved, so the only reason the
+  result survived at all was that per-quantile rates and score-distribution
+  stats had been hand-patched into the script as extra print statements
+  before that specific run. "No operating point found" was always a
+  legitimate result (the model's own reconstruction error dominated by
+  drift, not faults — `docs/RESULTS.md` §23) — treating it as an exception
+  meant the diagnostic that explained the failure only existed because
+  someone anticipated needing it for *this* run, not because the code
+  always produces it. Lesson: whatever diagnostic would be needed to
+  explain a run's failure should be emitted unconditionally, on every run,
+  before the failure mode is ever known to occur — not patched in after
+  the fact, and never gated behind the same code path that might raise
+  before reaching it.
 

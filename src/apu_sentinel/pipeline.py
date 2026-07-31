@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -796,7 +797,7 @@ def evaluate_isolation_forest_fold(
     }
 
 
-# --- Pass 23: LSTM Autoencoder (windowed, no cycle features) ---------------
+# --- Pass 23/24: Convolutional Autoencoder (windowed, no cycle features) ---
 #
 # Mirrors _fit_fold_isolation_forest/_build_windowed_input's shape, but never
 # computes cycle features (models/autoencoder.py's module docstring: this
@@ -812,6 +813,14 @@ def evaluate_isolation_forest_fold(
 # evaluation.threshold_quantiles whose POOLED false-alarm rate, taken as the
 # worst case (max) across every fold, is <= POOLED_FALSE_ALARM_CEILING --
 # and evaluates every fold at that single point only.
+#
+# Pass 24: on the real Colab run, NO swept quantile met the ceiling (see
+# docs/RESULTS.md §23) -- select_operating_quantile used to raise ValueError
+# in that case, discarding the completed training run along with it.
+# "No operating point found" is itself the result (the autoencoder's
+# reconstruction error is dominated by distribution drift, not faults --
+# docs/RESULTS.md §23's verdict); select_operating_quantile and
+# run_pipeline_autoencoder now report it instead of crashing on it.
 
 OPERATING_POINT_WIDTH_HOURS = 72.0
 # Reuses docs/RESULTS.md §22 Part B's selection ceiling verbatim -- not
@@ -939,54 +948,125 @@ def pooled_at_quantiles_autoencoder(
     }
 
 
+@dataclass(frozen=True)
+class OperatingPointSelection:
+    """select_operating_quantile()'s result (pass 24). "No swept quantile
+    meets the ceiling" is a RESULT to report, not a crash that discards a
+    completed training run -- the real Colab autoencoder run hit exactly
+    this case (docs/RESULTS.md §23) and a ValueError here threw away the
+    whole run along with it.
+    """
+
+    found: bool
+    quantile: float | None
+    # Worst-case (max across folds) pooled false-alarm rate at EVERY swept
+    # quantile, not only the chosen one -- this is the diagnostic that had
+    # to be hand-patched into a live Colab run to explain its own failure;
+    # it is now always computed and logged, never only on the failure path.
+    pooled_fa_per_day_by_quantile: dict[float, float]
+
+
 def select_operating_quantile(
     pooled_by_quantile_per_fold: dict[int, dict[float, PooledEvaluation]],
     ceiling: float,
-) -> float:
+) -> OperatingPointSelection:
     """docs/RESULTS.md §22 Part B's selection rule, reused verbatim: the
     LOOSEST swept quantile whose pooled false-alarm rate, taken as the
     WORST CASE (max) across every fold, is <= ceiling -- going tighter than
     necessary sacrifices sensitivity for no operational benefit. Selection
     depends only on false-alarm behaviour, never on detection outcomes.
 
-    Raises:
-        ValueError: if no swept quantile satisfies the ceiling in every
-            fold.
+    Every swept quantile's worst-case rate is logged at INFO, unconditionally
+    -- not only when none qualify (pass 24). Returns
+    OperatingPointSelection(found=False, ...) rather than raising when no
+    quantile satisfies the ceiling in every fold; the caller decides what to
+    do with that (run_pipeline_autoencoder reports it, it does not abort).
     """
     quantiles = sorted(next(iter(pooled_by_quantile_per_fold.values())).keys())
-    for q in quantiles:
-        worst = max(
+    rates = {
+        q: max(
             pooled_by_quantile_per_fold[fold_id][q].false_alarms_per_day
             for fold_id in pooled_by_quantile_per_fold
         )
-        if worst <= ceiling:
-            return q
-    raise ValueError(
-        f"no swept quantile (evaluation.threshold_quantiles={quantiles}) keeps the "
-        f"worst-case pooled false-alarm rate across all folds under the ceiling "
-        f"({ceiling}/day) -- widen the quantile grid or raise the ceiling deliberately."
+        for q in quantiles
+    }
+    for q in quantiles:
+        logger.info(
+            "select_operating_quantile: quantile=%s worst-case pooled fa/day=%.3f (ceiling=%s)",
+            q,
+            rates[q],
+            ceiling,
+        )
+    for q in quantiles:
+        if rates[q] <= ceiling:
+            return OperatingPointSelection(
+                found=True, quantile=q, pooled_fa_per_day_by_quantile=rates
+            )
+    logger.warning(
+        "select_operating_quantile: no swept quantile (evaluation.threshold_quantiles=%s) "
+        "keeps the worst-case pooled false-alarm rate under the ceiling (%s/day) -- "
+        "reporting operating_point_found=False instead of raising (docs/RESULTS.md §23)",
+        quantiles,
+        ceiling,
     )
+    return OperatingPointSelection(found=False, quantile=None, pooled_fa_per_day_by_quantile=rates)
+
+
+def _score_distribution_summary(
+    train_scores: np.ndarray, test_scores: np.ndarray
+) -> dict[str, float]:
+    """Train vs. test reconstruction-error distribution for one fold (pass
+    24) -- median/p99/max of each, plus the fraction of test scores above
+    the train p99. This is what diagnosed the autoencoder's failure mode
+    (docs/RESULTS.md §23: score drift with distance from the training
+    window, not fault detection); it is now a permanent per-fold log line
+    in run_pipeline_autoencoder rather than something that had to be
+    hand-patched onto a live Colab run to see.
+    """
+    train_p99 = float(np.quantile(train_scores, 0.99))
+    return {
+        "train_median": float(np.median(train_scores)),
+        "train_p99": train_p99,
+        "train_max": float(train_scores.max()),
+        "test_median": float(np.median(test_scores)) if len(test_scores) else float("nan"),
+        "test_p99": float(np.quantile(test_scores, 0.99)) if len(test_scores) else float("nan"),
+        "test_max": float(test_scores.max()) if len(test_scores) else float("nan"),
+        "frac_test_above_train_p99": (
+            float(np.mean(test_scores > train_p99)) if len(test_scores) else float("nan")
+        ),
+    }
 
 
 def run_pipeline_autoencoder(settings: Settings) -> dict[str, object]:
-    """LSTM Autoencoder across every walk-forward fold (arm A only -- March
-    included, common folds, no additional_regions), evaluated at ONE
+    """Convolutional Autoencoder across every walk-forward fold (arm A only
+    -- March included, common folds, no additional_regions), evaluated at ONE
     pre-registered operating point (docs/RESULTS.md §22 Part B's rule,
     reused verbatim -- see select_operating_quantile). Never sweeps
     (width x quantile): docs/RESULTS.md §22's own lesson is that a wide
     sweep reports a maximum, not a p-value.
 
-    Returns {"operating_point": {"width_hours", "quantile"},
-             "folds": {event_id: {"result": FoldEvaluation,
-                                   "chance": ChanceComparison,
-                                   "pooled": PooledEvaluation,
-                                   "training_summary": {...}}}}.
+    Returns, when an operating point is found:
+        {"operating_point": {"width_hours", "quantile", "found": True,
+                              "pooled_fa_per_day_by_quantile"},
+         "folds": {event_id: {"result": FoldEvaluation,
+                               "chance": ChanceComparison,
+                               "pooled": PooledEvaluation,
+                               "training_summary": {...},
+                               "score_distribution": {...}}}}.
+
+    When no swept quantile keeps the worst-case pooled false-alarm rate
+    under POOLED_FALSE_ALARM_CEILING (pass 24 -- previously a raised
+    ValueError, see docs/RESULTS.md §23):
+        {"operating_point": {"width_hours", "found": False,
+                              "pooled_fa_per_day_by_quantile"},
+         "folds": {event_id: {"training_summary": {...},
+                               "score_distribution": {...}}}} -- detection
+    is never evaluated in this branch, since there is no chosen threshold to
+    evaluate it at.
 
     Raises:
         NotImplementedError: if settings.model.autoencoder is not
             configured.
-        ValueError: from select_operating_quantile if no swept quantile
-            satisfies the pooled false-alarm ceiling in every fold.
     """
     if settings.model.autoencoder is None:
         raise NotImplementedError(
@@ -1032,6 +1112,29 @@ def run_pipeline_autoencoder(settings: Settings) -> dict[str, object]:
         )
 
         train_scores = model.score(train_input)
+        full_scores = model.score(fold_input)
+        full_contributions = model.contributions(fold_input)
+
+        test_mask = (fold_input.index >= extended_fold.test_start) & (
+            fold_input.index <= extended_fold.test_end
+        )
+        test_scores = full_scores[test_mask]
+
+        distribution = _score_distribution_summary(train_scores, test_scores)
+        logger.info(
+            "run_pipeline_autoencoder: fold %d score distribution -- train "
+            "med=%.5f p99=%.5f max=%.5f | test med=%.5f p99=%.5f max=%.5f "
+            "frac_test_above_train_p99=%.4f",
+            fold.event_id,
+            distribution["train_median"],
+            distribution["train_p99"],
+            distribution["train_max"],
+            distribution["test_median"],
+            distribution["test_p99"],
+            distribution["test_max"],
+            distribution["frac_test_above_train_p99"],
+        )
+
         pooled_by_quantile = pooled_at_quantiles_autoencoder(
             df, regimes, model, scalers, train_scores, stretches, settings
         )
@@ -1041,29 +1144,53 @@ def run_pipeline_autoencoder(settings: Settings) -> dict[str, object]:
             "event": event,
             "model": model,
             "fold_input": fold_input,
+            "full_scores": full_scores,
+            "full_contributions": full_contributions,
             "train_scores": train_scores,
             "pooled_by_quantile": pooled_by_quantile,
+            "score_distribution": distribution,
+            "training_summary": {
+                "epochs_run": model.epochs_run_,
+                "final_train_loss": model.final_train_loss_,
+                "final_val_loss": model.final_val_loss_,
+                "elapsed_seconds": model.elapsed_seconds_,
+                "device": model.device_,
+            },
         }
 
-    chosen_quantile = select_operating_quantile(
+    selection = select_operating_quantile(
         {fold_id: entry["pooled_by_quantile"] for fold_id, entry in per_fold.items()},
         POOLED_FALSE_ALARM_CEILING,
     )
+
+    if not selection.found:
+        return {
+            "operating_point": {
+                "width_hours": OPERATING_POINT_WIDTH_HOURS,
+                "found": False,
+                "pooled_fa_per_day_by_quantile": selection.pooled_fa_per_day_by_quantile,
+            },
+            "folds": {
+                fold_id: {
+                    "training_summary": entry["training_summary"],
+                    "score_distribution": entry["score_distribution"],
+                }
+                for fold_id, entry in per_fold.items()
+            },
+        }
 
     results: dict[int, dict[str, object]] = {}
     for fold_id, entry in per_fold.items():
         fold, event, model = entry["fold"], entry["event"], entry["model"]
         fold_input = entry["fold_input"]
 
-        threshold = fit_threshold_sweep(entry["train_scores"], settings)[chosen_quantile]
-        full_scores = model.score(fold_input)
-        full_contributions = model.contributions(fold_input)
+        threshold = fit_threshold_sweep(entry["train_scores"], settings)[selection.quantile]
 
         test_mask = (fold_input.index >= fold.test_start) & (fold_input.index <= fold.test_end)
         test_data = ScoredTestData(
             timestamps=fold_input.index[test_mask],
-            scores=full_scores[test_mask],
-            contributions=full_contributions[test_mask],
+            scores=entry["full_scores"][test_mask],
+            contributions=entry["full_contributions"][test_mask],
             channel_names=model.contributor_names,
             expected_interval=expected_interval,
         )
@@ -1076,20 +1203,17 @@ def run_pipeline_autoencoder(settings: Settings) -> dict[str, object]:
         results[fold_id] = {
             "result": result,
             "chance": chance,
-            "pooled": entry["pooled_by_quantile"][chosen_quantile],
-            "training_summary": {
-                "epochs_run": model.epochs_run_,
-                "final_train_loss": model.final_train_loss_,
-                "final_val_loss": model.final_val_loss_,
-                "elapsed_seconds": model.elapsed_seconds_,
-                "device": model.device_,
-            },
+            "pooled": entry["pooled_by_quantile"][selection.quantile],
+            "training_summary": entry["training_summary"],
+            "score_distribution": entry["score_distribution"],
         }
 
     return {
         "operating_point": {
             "width_hours": OPERATING_POINT_WIDTH_HOURS,
-            "quantile": chosen_quantile,
+            "quantile": selection.quantile,
+            "found": True,
+            "pooled_fa_per_day_by_quantile": selection.pooled_fa_per_day_by_quantile,
         },
         "folds": results,
     }

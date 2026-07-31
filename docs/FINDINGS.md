@@ -25,6 +25,7 @@ record), since they are read for different reasons and grow fastest.
 | 10 | [`findings/10-process-lessons.md`](findings/10-process-lessons.md) | Working-practice lessons (notebook CWD, kernel restarts, config strictness, verifying claims independently, a contract test catching a design gap before a second model made it costly). |
 | 11 | [`findings/11-regime-scaling-and-cycle-features.md`](findings/11-regime-scaling-and-cycle-features.md) | Per-(fold, regime) scaler wiring and sample counts; amplification warnings fired on the real dataset; cycle-timing feature gap-truncation stats. |
 | 12 | [`findings/12-event2-error-analysis.md`](findings/12-event2-error-analysis.md) | Error analysis on event 2's out-of-window precursor (pass 16): **boiling-frog mechanism confirmed** (the 7-day trailing baseline absorbs the sustained STOPPED-duration collapse); event 2's own window shows an elevated 98.8th-percentile near-miss, not nothing; the pattern is general across all four events, not unique to event 2; mid-May is **indistinguishable** from the unreported March cluster. |
+| 13 | [`findings/13-autoencoder-drift.md`](findings/13-autoencoder-drift.md) | Conv autoencoder reaches no operating point at any tested threshold: reconstruction error tracks **temporal distance from its training window**, not anomalousness — a direct consequence of the ~3× cycle-timing drift; possible mitigations recorded, not attempted. |
 
 ## Results
 

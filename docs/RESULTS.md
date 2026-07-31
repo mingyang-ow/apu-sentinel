@@ -10,7 +10,7 @@ the record, the same principle as the April-gap correction in
 ## Contents
 
 **Current**
-- [23. Convolutional autoencoder — architecture + local smoke validation; Colab operating-point run pending (pass 23 v2)](#23-convolutional-autoencoder--architecture--local-smoke-validation-colab-operating-point-run-pending-pass-23-v2)
+- [23. Convolutional autoencoder — no operating point at any tested threshold; drift, not fault detection (pass 23 v2 / pass 24)](#23-convolutional-autoencoder--no-operating-point-at-any-tested-threshold-drift-not-fault-detection-pass-23-v2--pass-24)
 - [22. Event-4 detection validation: gap-artifact check negative, no aggregate skill at the pre-registered operating point (pass 22)](#22-event-4-detection-validation-gap-artifact-check-negative-no-aggregate-skill-at-the-pre-registered-operating-point-pass-22)
 - [21. Isolation Forest: arm A/B + quantile sweep, explained detections (pass 21)](#21-isolation-forest-arm-ab--quantile-sweep-explained-detections-pass-21)
 - [20. Exclusion-selection fix (overlap-based) — the lever now reaches, and it still isn't enough (pass 20)](#20-exclusion-selection-fix-overlap-based--the-lever-now-reaches-and-it-still-isnt-enough-pass-20)
@@ -26,7 +26,7 @@ the record, the same principle as the April-gap correction in
 
 ## Current results
 
-### 23. Convolutional autoencoder — architecture + local smoke validation; Colab operating-point run pending (pass 23 v2)
+### 23. Convolutional autoencoder — no operating point at any tested threshold; drift, not fault detection (pass 23 v2 / pass 24)
 
 Replaces pass 23's LSTM version, which hung on CPU during the local smoke
 check -- diagnosed as compute-bound (16 idle cores, 4.9Gi free, 0B swap),
@@ -79,14 +79,83 @@ time-based validation split, determinism, constant-channel near-zero
 contribution, `max_minutes` budget enforcement, and the shape round-trip.
 Full suite: 149 passed, 1 skipped (pre-existing, unrelated). Lint clean.
 
-**Not yet done**: the real Colab run (`configs/colab.yaml`, full data, real
-epochs/budget) that produces the actual per-fold training logs, the
-pre-registered operating point (72h width, loosest quantile with pooled
-false-alarm rate ≤ 0.3/day), the aggregate skill statistic, and the
-four-way comparison against rule-based / Isolation Forest arm A / arm B.
-Per CLAUDE.md and this brief, training never happens on the laptop -- that
-step requires an actual Colab GPU runtime and is not run here. This section
-will be updated with those results once that run completes.
+#### Colab run (pass 24)
+
+Trained successfully on Colab (T4, CUDA confirmed) across all four folds --
+raw log: `docs/logs/colab-autoencoder-2026-08-04.txt`. `select_operating_
+quantile` then found that **no swept quantile keeps the worst-case pooled
+false-alarm rate under the 0.3/day ceiling**, even at the tightest swept
+value (0.99995). Pass 23's code raised `ValueError` at this point, which
+discarded the completed run along with it (Part A below fixes this).
+
+**Worst-case pooled false-alarm rate by quantile** (`score_stride: 5min`,
+288 scores/day; "expected if calibrated" is `288 * (1 - quantile)`, i.e.
+the rate a correctly-calibrated `threshold_quantile` should produce if
+train and test scores came from the same distribution):
+
+| quantile | fa/day | expected if calibrated | excess |
+|---|---|---|---|
+| 0.99 | 6.47 | ~2.9 | 2.2× |
+| 0.995 | 4.59 | ~1.4 | 3.2× |
+| 0.999 | 1.75 | ~0.29 | 6.0× |
+| 0.9995 | 1.28 | ~0.14 | 9.1× |
+| 0.9999 | 0.59 | ~0.03 | 20× |
+| 0.99995 | 0.45 | ~0.014 | 32× |
+
+Excess **grows** with quantile rather than shrinking -- tightening the
+threshold does not converge toward the calibrated rate, it diverges from
+it further. That shape, on its own, rules out "just needs a tighter
+threshold" as a fix.
+
+**Train vs. test reconstruction-error distribution, per fold**:
+
+| fold | test period | train med | test med | shift | frac test > train p99 |
+|---|---|---|---|---|---|
+| 1 | April | 0.334 | 0.358 | +7% | 1.8% |
+| 2 | May | 0.299 | 0.480 | +60% | 1.3% |
+| 3 | June | 0.288 | 0.540 | +88% | 2.8% |
+| 4 | Jul–Aug | 0.397 | 0.550 | +39% | 3.7% |
+
+(train max 8.19–11.00 vs. test max 8.75–11.05 across the four folds --
+the extremes barely move; see diagnosis below.)
+
+**Diagnosis: distribution shift, not fault detection.** Fold 1 tests one
+week past its training window and barely shifts (+7%); folds 2-4 test
+weeks to months later and reconstruct roughly 40-90% worse **at the
+median** -- on ordinary test-period data, not anomalies. Excess false
+alarms rise with temporal distance from the training period, consistent
+with the ~3× cycle-timing drift already recorded in
+`docs/findings/08-cycle-timing.md`.
+
+The maxima are the tell: if faults produced distinctive reconstruction
+failures, test maxima would exceed training maxima by a wide margin. They
+do not (they are within ~1 unit of each other, in both directions, across
+all four folds) -- the whole distribution shifted up, not just its tail.
+The exceedance fraction (test scores above the train p99) is only
+1.3-3.7%, close to the 1% a stationary distribution would give -- yet the
+resulting false-alarm rate is 6-32× the calibrated expectation, because
+drift-driven exceedances **cluster into sustained episodes** rather than
+scattering independently across the test period; episode-level counting
+(CLAUDE.md's own metric, correctly) turns a mild, sustained median shift
+into a large number of alerted episodes.
+
+**Verdict**:
+
+> The convolutional autoencoder reaches no operational false-alarm rate at
+> any tested threshold. Its reconstruction error is dominated by
+> non-stationarity rather than by faults: the model measures temporal
+> distance from its training period, not anomalousness.
+
+#### Four-way comparison — the project's headline result
+
+| model | aggregate skill result |
+|---|---|
+| rule-based (lagged, 24h margin) | p = 0.737 |
+| Isolation Forest, arm A | p = 0.375 |
+| Isolation Forest, arm B | p = 0.833 |
+| conv autoencoder | no operating point ≤ 0.3/day |
+
+Three models, none with skill at an honest single operating point.
 
 ### 22. Event-4 detection validation: gap-artifact check negative, no aggregate skill at the pre-registered operating point (pass 22)
 

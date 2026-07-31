@@ -25,6 +25,16 @@ data/processed/*
 # Experiment tracking
 mlruns/
 
+# Model checkpoints -- none committed, whatever future pass names its dir.
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+
+# Notebook checkpoint dirs (Jupyter autosave) -- actual notebooks ARE
+# committed (notebooks/exploratory/); only their autosave copies are not.
+.ipynb_checkpoints/
+
 # Editors / OS
 .vscode/
 .idea/

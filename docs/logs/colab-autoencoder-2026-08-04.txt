@@ -1,0 +1,26 @@
+/content/apu-sentinel/data/raw/MetroPT3(AirCompressor).csv: dropping unnamed column(s) ['Unnamed: 0'] -- pandas' auto-generated name for an index column that was written into the CSV (a serialisation artifact, not a sensor channel).
+DIST fold 1: train med=0.33422 p99=4.12209 max=8.19214 | test med=0.35786 p99=4.70345 max=9.88832 | frac_test_above_train_p99=0.0176
+DIST fold 2: train med=0.29898 p99=3.68779 max=10.67074 | test med=0.47960 p99=4.06908 max=9.87639 | frac_test_above_train_p99=0.0131
+DIST fold 3: train med=0.28801 p99=3.54402 max=11.00268 | test med=0.54004 p99=4.87952 max=11.04668 | frac_test_above_train_p99=0.0281
+DIST fold 4: train med=0.39730 p99=3.02512 max=10.68844 | test med=0.55028 p99=4.80337 max=8.75428 | frac_test_above_train_p99=0.0372
+DIAG quantile=0.99: worst-case pooled fa/day = 6.466
+DIAG quantile=0.995: worst-case pooled fa/day = 4.585
+DIAG quantile=0.999: worst-case pooled fa/day = 1.747
+DIAG quantile=0.9995: worst-case pooled fa/day = 1.275
+DIAG quantile=0.9999: worst-case pooled fa/day = 0.592
+DIAG quantile=0.99995: worst-case pooled fa/day = 0.451
+train.py finished. result=None
+NOTE: attempted best-effort Colab runtime disconnect. This is NOT guaranteed -- verify in the Colab UI that the session actually ended.
+Traceback (most recent call last):
+  File "/content/apu-sentinel/scripts/train.py", line 92, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/content/apu-sentinel/scripts/train.py", line 75, in main
+    result = PIPELINES[args.model](settings)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/content/apu-sentinel/src/apu_sentinel/pipeline.py", line 1068, in run_pipeline_autoencoder
+    chosen_quantile = select_operating_quantile(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/content/apu-sentinel/src/apu_sentinel/pipeline.py", line 970, in select_operating_quantile
+    raise ValueError(
+ValueError: no swept quantile (evaluation.threshold_quantiles=[0.99, 0.995, 0.999, 0.9995, 0.9999, 0.99995]) keeps the worst-case pooled false-alarm rate across all folds under the ceiling (0.3/day) -- widen the quantile grid or raise the ceiling deliberately.

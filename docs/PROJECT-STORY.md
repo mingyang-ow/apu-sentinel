@@ -35,6 +35,23 @@ few examples to learn "what failure looks like", so the approach is to learn
   either: the parameter that would need widening only ever excludes an
   *earlier* event's precursor from a *later* fold, never an event's own
   precursor from its own fold. The margin stays where it was.
+- Built Isolation Forest, the second model in the progression. A wide sweep
+  looked promising for event 4 (p as low as 0.004) — but a 160-combination
+  grid finds a maximum, not a p-value. Reading the result off ONE
+  pre-registered operating point instead (chosen on false-alarm grounds
+  only, before looking at detections) gave an unremarkable p≈0.37–0.83,
+  matching the rule-based baseline's own honest score.
+- Built a convolutional autoencoder, the third and final model — testing
+  whether relationships BETWEEN channels break down before failure, the one
+  mechanism neither prior model could see. Trained successfully on Colab.
+  No swept detection threshold kept false alarms under the ceiling, at any
+  quantile tested. Traced why: the model's reconstruction error tracks
+  *how far the test period sits from the training window* (the system
+  drifts ~3× over the recording span), not whether the data is anomalous —
+  a fault-detection failure mode distinct from the first two models' own
+  (chance-level rather than drift-dominated).
+- Three models, three honest negative results, one consistent metric. That
+  consistency — not a working detector — is this project's actual output.
 
 ## The passes
 
@@ -58,7 +75,10 @@ few examples to learn "what failure looks like", so the approach is to learn
 | **16** | **Error analysis → boiling-frog bug found** |
 | 17 | Lagged baseline → feature fixed, calibration absorbed it |
 | 18 | Training-margin sweep → negative, for a verified structural reason |
-| 19 | This housekeeping pass |
+| 19 | Housekeeping pass |
+| **20-22** | **Isolation Forest → one pre-registered operating point → no skill (p≈0.37-0.83)** |
+| 23 | Convolutional autoencoder (replacing an LSTM that hung on CPU) |
+| **24** | **No operating point at any threshold → traced to drift, not faults** |
 
 Bold = load-bearing. The rest support them.
 
@@ -78,8 +98,16 @@ Bold = load-bearing. The rest support them.
 ## Status
 
 Pipeline: complete and guarded. Evaluation: complete, with chance
-comparison. Models: one built, honestly measured at zero skill.
+comparison. Model progression complete — three models, one consistent
+metric, none with skill at an honest single operating point:
 
-Next: Isolation Forest, then an autoencoder — both scored on the same
-harness against a zero-skill bar, so any real detection is unambiguous.
-Optional extensions after that: live-data simulation, alert API, dashboard.
+| model | aggregate skill result |
+|---|---|
+| rule-based (lagged, 24h margin) | p = 0.737 |
+| Isolation Forest, arm A | p = 0.375 |
+| Isolation Forest, arm B | p = 0.833 |
+| conv autoencoder | no operating point ≤ 0.3/day |
+
+Optional extensions from here: live-data simulation, alert API, dashboard —
+or drift-adaptive scoring, the autoencoder's own most direct follow-up
+(`docs/findings/13-autoencoder-drift.md`).
